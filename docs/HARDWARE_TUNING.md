@@ -32,12 +32,18 @@ Keep **`libstrata_kq.so` beside the actual `strata` executable**, including when
 or archiving it. The loader resolves the executable directory, not the working
 directory. A missing library silently selects the slower FP16 expert path. For Q4
 validate both the process's loaded library maps and the engine log reporting
-`48 of 48 layers` for resident prompt MMQ.
+`48 of 48 layers` for resident prompt MMQ. Q2 and IQ types use the statically
+linked MMQ instances, so they do not need to map the K-quant shared library.
 
 ARM GPU-only mode requires every expert resident, the graph hit path and zero CPU
 prefill share. CPU expert execution is unsupported and traps if reached. Use the
 model's own profile geometry: 24576 experts for the full family, 12288 for Coder,
-plus any cache guard slots requested by the engine. This is not a general ARM CPU backend.
+plus space for MMQ guards. Native-pack `--expert-cache N` is a byte budget of
+`N * align256(largest_blob)`, rather than a promise of N resident experts. Direct
+MMQ adds 256 bytes per expert slot. For uniform blobs use at least
+`ceil(experts * align256(blob + 256) / align256(blob))`; a budget suitable for Q4
+can otherwise leave two Q2_0 experts outside the cache. Check the actual filled
+count in the engine log. This is not a general ARM CPU backend.
 
 Run from the root after sourcing the preset; update conflicting server config `env`
 values. HC requantization stays disabled. The register-only convolution candidate
