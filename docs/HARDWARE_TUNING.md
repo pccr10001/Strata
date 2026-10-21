@@ -62,10 +62,20 @@ at temperature 0, seed 42. Cached tokens and draft counts are zero. Complete
 choices and usage match between builds for all three fixed prompts. This is an
 upgrade compatibility check, not a speedup claim against stock upstream.
 
-The previously measured ~1844 tokens/s was not reproduced: sampled power is
-53.45-55.27 W in the current session. The SMU power limit could not be read without
-sudo, so the cause is not confirmed. Do not compare the old 120 W session with this
-session as evidence of a software regression. No 90%-of-theoretical claim is made.
+The first comparison above was power-limited: sampled power was about 55 W.
+After the user restored the 120 W limit, the same three-prompt test was repeated:
+
+| Build | Median prefill tokens/s | Median target decode tokens/s |
+| --- | ---: | ---: |
+| Preserved pre-update optimized build | 1694.1 | 26.2 |
+| v0.2.1.4 with selected optimizations | 1697.9 | 26.3 |
+
+All three complete choices and usage still match. Peak sampled hwmon power is
+113.5 W (old) / 113.1 W (new); the configured SMU limit was reported by the user,
+not independently read. Downloads were suspended throughout both runs. First-run
+prefill is 1309.7 / 1379.2 tokens/s; subsequent runs are 1694.1-1701.0 tokens/s.
+The previously measured ~1844 tokens/s was not reproduced. No 90%-of-theoretical
+claim is made.
 
 Reproduce with `tools/tuning/bench_local_prefill.py --lines 512 --trials 3
 --max-tokens 256 --expect-no-drafts --label pure-target-matched16k`, supplying

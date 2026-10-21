@@ -6,9 +6,10 @@ memory writes and copies, and one-token decode state commits for Ryzen AI Max+ 3
 The original weights, int8 KV and native 262144-token context are retained.
 
 Same-day CYBER-FROST Q4 test (16602-token uncached prompts, 256 generated tokens,
-three trials): **1295.4 tokens/s prefill, 25.9 tokens/s decode**; preserved optimized
-build: 1290.2 / 25.9. Current sampled power is about 55 W; the earlier ~1844 prefill
-result from the 120 W session was not reproduced.
+three trials, after restoring the user-reported 120 W limit): **1697.9 tokens/s
+prefill, 26.3 tokens/s decode**; preserved optimized build: 1694.1 / 26.2. All three
+complete choices and usage match. Peak sampled hwmon power is about 113 W.
+The initial ~55 W comparison and native-context validation are recorded below.
 
 Build, tuning presets, validation and limitations: [hardware tuning](docs/HARDWARE_TUNING.md).
 Old checkouts and binaries are preserved separately; external cache-server work is excluded.
