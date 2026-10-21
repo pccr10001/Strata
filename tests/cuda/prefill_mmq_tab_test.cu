@@ -72,6 +72,8 @@ void fill_matrix(uint8_t* m, ggml_type t, int64_t rows, int64_t cols, std::mt199
     for (size_t b = 0; b < nb; ++b) {
         const ggml_fp16_t h = ggml_fp32_to_fp16(sc(rng));
         std::memcpy(m + b * bs, &h, 2);
+        if (t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_1)
+            std::memcpy(m + b * bs + 2, &h, 2);
     }
 }
 
@@ -533,10 +535,10 @@ int main() {
         const Shape main_shapes[] = {{GGML_TYPE_IQ3_S, 1280, 2560, "gate/up"},
                                      {GGML_TYPE_IQ4_NL, 2560, 640, "down"},
                                      {GGML_TYPE_Q8_0, 2560, 640, "down"}};
-        // the types without a pointer table (the optional Q5_0 / K-quant instances) must keep the gather
-        for (const ggml_type t : {GGML_TYPE_Q5_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q5_1, GGML_TYPE_Q6_K}) {
+        // Formats without a pointer-table instance must keep the gather.
+        for (const ggml_type t : {GGML_TYPE_Q5_0, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
             if (mmq::tab_fits((int) t, 1280) || mmq::tab_fits((int) t, 2560)) {
-                std::printf("FAIL: %s reports a pointer table (only the nine tested types have one)\n", ggml_type_name(t));
+                std::printf("FAIL: %s unexpectedly reports a pointer table\n", ggml_type_name(t));
                 return 1;
             }
         }
@@ -573,9 +575,27 @@ int main() {
             }
             sweep(ctx, sh, false, rng, s);
         }
+        const Shape kq_shapes[] = {{GGML_TYPE_Q4_K, 1280, 2560, "gate/up"},
+                                  {GGML_TYPE_Q5_1, 2560, 640, "down"}};
+        const bool kq = mmq::supported(GGML_TYPE_Q4_K) && mmq::supported(GGML_TYPE_Q5_1);
+        if (kq) {
+            for (const Shape& sh : kq_shapes) {
+                if (!mmq::tab_fits((int) sh.t, sh.rows) ||
+                    mmq::overread_bytes((int) sh.t, sh.cols) > mmq::kSlotGuard ||
+                    (sh.t == GGML_TYPE_Q4_K && mmq::overread_bytes((int) sh.t, sh.cols) != 0)) {
+                    std::printf("FAIL: unsafe or missing K-quant pointer table for %s\n", ggml_type_name(sh.t));
+                    return 1;
+                }
+                sweep(ctx, sh, true, rng, s);
+            }
+        } else {
+            std::printf("K-quant pointer tables not tested: enable STRATA_MMQ_KQUANTS and STRATA_MMQ_KQ=1\n");
+        }
         // Part 3
         const int f0 = g_fail, c0 = g_cases;
-        for (const Pair pr : {Pair{GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL}, Pair{GGML_TYPE_IQ3_S, GGML_TYPE_Q8_0}}) {
+        std::vector<Pair> pairs = {{GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL}, {GGML_TYPE_IQ3_S, GGML_TYPE_Q8_0}};
+        if (kq) pairs.push_back({GGML_TYPE_Q4_K, GGML_TYPE_Q5_1});
+        for (const Pair pr : pairs) {
             for (int gg = 0; gg < 2; ++gg) {
                 const bool group_gather = gg == 1;
                 // alternating direct / gathered, last entry direct

@@ -1,3 +1,19 @@
+# GB10 / Blackwell optimization branch
+
+Based on upstream **v0.2.1.4** (`9de04cd4`, engine 0.1.46.3).
+Adds opt-in ARM64 GPU-only builds, resident Q4_K/Q5_1 pointer-table MMQ, 16-token
+GDN staging, flat normalization and SM121 convolution/L2 fusion.
+The original weights, int8 KV and native 262144-token context are retained.
+
+**Measured on GB10:** median 1852.4 tokens/s prefill and 27.3 tokens/s target-only
+decode with CYBER-FROST-3.8 Q4, 16603-token uncached prompts, 256 generated tokens,
+three trials. Keep `libstrata_kq.so` beside the actual executable.
+
+Build, tuning presets, validation and limitations: [hardware tuning](docs/HARDWARE_TUNING.md).
+Old checkouts and binaries are preserved separately; external cache-server work is excluded.
+
+---
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="apps/host/public/brand/strata-lockup-dark.svg">

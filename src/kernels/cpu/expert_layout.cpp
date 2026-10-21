@@ -7,7 +7,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
-#if defined(_MSC_VER)
+#if defined(STRATA_GPU_ONLY_ARM)
+#elif defined(_MSC_VER)
 #include <intrin.h>
 #include <immintrin.h>
 #else
@@ -39,6 +40,19 @@ int cpu_isa_cap() {
     return cap;
 }
 
+#if defined(STRATA_GPU_ONLY_ARM)
+bool cpu_avx512_ok() { return false; }
+bool cpu_avx512bw_ok() { return false; }
+bool cpu_avx2_ok() { return false; }
+bool cpu_avx1_ok() { return false; }
+bool cpu_sse42_ok() { return false; }
+bool cpu_avxvnni_ok() { return false; }
+bool cpu_gather_fast() { return false; }
+bool cpu_gather_fast_here() { return false; }
+int iq256_gather_setting() { return 0; }
+const char* isa_floor_build() { return ""; }
+std::string cpu_name() { return "ARM64 GPU-only"; }
+#else
 bool cpu_avx512_ok() {
     static const bool ok = [] {
         if (const char* f = std::getenv("STRATA_FORCE_AVX2"); f != nullptr && f[0] == '1') return false;
@@ -296,6 +310,8 @@ std::string cpu_name() {
     return b0 == std::string::npos ? std::string("unknown") : name.substr(b0, b1 - b0 + 1);
 }
 
+#endif
+
 // ---- the AVX-512 probe and the oracle flag (#795) ----
 //
 // expert.cpp and iq_avx512.cpp are compiled for AVX-512, and a TU compiled that way may use AVX-512 in ANY of its
@@ -320,6 +336,9 @@ const char* CpuFeatures::reason() const {
     return buf;
 }
 
+#if defined(STRATA_GPU_ONLY_ARM)
+CpuFeatures cpu_features() { return {}; }
+#else
 CpuFeatures cpu_features() {
     CpuFeatures f;
     int reg[4] = {0, 0, 0, 0};
@@ -342,6 +361,8 @@ CpuFeatures cpu_features() {
     f.avx512_vbmi = (ecx >> 1) & 1u;
     return f;
 }
+
+#endif
 
 void cpu_require_expert_support() {
     const CpuFeatures f = cpu_features();

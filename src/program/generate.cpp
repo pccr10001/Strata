@@ -3333,6 +3333,7 @@ int main(int argc, char** argv) {
     // next.  Refused here, by name, rather than an illegal instruction in the first expert.
     // The experimental older-CPU build (STRATA_ISA_FLOOR=avx|none, compiled on that PC; #394 #595 #623) has ggml-cpu
     // for that floor, so a native pack's experts run there on ggml-cpu (every AVX2 kernel is behind cpu_avx2_ok).
+#if !defined(STRATA_GPU_ONLY_ARM)
     const char* isa_floor = strata::kernels::cpu::isa_floor_build();
 #if defined(STRATA_GPU_METAL)   // Apple Silicon: every expert is on the GPU; ggml-cpu (NEON) is the only CPU expert code
     strata::metal_engine::set_model_shard(o.native_preset.c_str());   // the decode window reads the model GGUF itself
@@ -3365,6 +3366,7 @@ int main(int argc, char** argv) {
                                  "and the normal build is faster on it\n", isa_floor);
     }
 
+#endif
     std::string err;
     if (!o.native_head_gguf.empty() && !o.stream_token) {
         std::fprintf(stderr, "--native-head-gguf requires --stream-token\n");
@@ -6739,6 +6741,13 @@ int main(int argc, char** argv) {
         }
         drive.routing = routing;
     }
+#if defined(STRATA_GPU_ONLY_ARM)
+    if (o.no_pool || o.no_capture || o.no_token_graph || profile.empty() ||
+        xcache.resident() != g.n_layers * g.n_expert) {
+        std::fprintf(stderr, "GPU-only ARM requires every expert resident and the graph hit path\n");
+        return 1;
+    }
+#endif
     strata::core::PoolFn pool_fn = o.no_pool ? nullptr : &drive_pool;
     // The hit hook rides the same switch as the pool: with no pool there is no `parts` staging to
     // write into, and a hit path with nowhere to write is a wrong token rather than an error.
@@ -8612,6 +8621,9 @@ int main(int argc, char** argv) {
                     size_t fb = 0, tb = 0;
                     cudaMemGetInfo(&fb, &tb);
                     const int64_t need = (int64_t) strata::prefill::Prefill::bytes_needed(g, i == 0 ? ss : stages[i - 1]->ss, c, srcp != nullptr);
+                    // On UMA the OS can reclaim file cache; raw driver free memory can be far smaller.
+                    const char* uma = std::getenv("STRATA_PREFILL_UMA_AVAILABLE");
+                    if (uma && std::string(uma) == "1") fb = strata::core::device_free_bytes();
                     if (need + kHeadroom > (int64_t) fb) {
                         dev_out = dev < 0 ? 0 : dev; need_out = need; free_out = (int64_t) fb;
                         return false;

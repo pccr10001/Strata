@@ -397,6 +397,47 @@ __global__ void gdn_conv_l2_kernel(const float* __restrict__ hist, const float* 
         __syncthreads();
     }
 }
+#if !defined(__HIPCC__)
+// Opt-in CONVL2=2; keep the original fused kernel unchanged.
+__global__ void gdn_conv_l2_rounded_kernel(const float* __restrict__ hist, const float* __restrict__ qkv,
+                                   const float* __restrict__ w, float* __restrict__ h, int64_t T, float eps) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t t0 = (int64_t) blockIdx.y * CONV_TILE;
+    if (t0 >= T) return;
+    const int64_t t1 = t0 + CONV_TILE < T ? t0 + CONV_TILE : T;
+    auto input = [&](int64_t t) -> float { return t >= 0 ? qkv[t * C + c] : hist[c * 3 + (int) (t + 3)]; };
+    float v0 = input(t0 - 3), v1 = input(t0 - 2), v2 = input(t0 - 1);
+    const float w0 = w[c * 4], w1 = w[c * 4 + 1], w2 = w[c * 4 + 2], w3 = w[c * 4 + 3];
+    for (int64_t t = t0; t < t1; ++t) {
+        const float x = qkv[t * C + c];
+        // Match standalone SM121 SASS: round tap 1, then FMA taps 0, 2, 3.
+        const float s = __fmaf_rn(x, w3, __fmaf_rn(v2, w2,
+                            __fmaf_rn(v0, w0, __fmul_rn(v1, w1))));
+        h[t * C + c] = s / (1.0f + __expf(-s));
+        v0 = v1; v1 = v2; v2 = x;
+    }
+    if (blockIdx.x >= 2 * HK) return;   // v channels: no norm
+    __shared__ float part[16][4];
+    for (int64_t tb = t0; tb < t1; tb += 16) {
+        const int n = (int) (t1 - tb < 16 ? t1 - tb : 16);
+        for (int j = 0; j < n; ++j) {   // (each thread reads back its own stored value)
+            const float v = h[(tb + j) * C + c];
+            // SM121's standalone norm rounds each square before the first XOR add.
+            const float square = __fmul_rn(v, v);
+            float sq = __fadd_rn(square, __shfl_xor_sync(0xffffffffu, square, 16));
+#pragma unroll
+            for (int o = 8; o > 0; o >>= 1) sq = __fadd_rn(sq, __shfl_xor_sync(0xffffffffu, sq, o));
+            if ((threadIdx.x & 31) == 0) part[j][threadIdx.x >> 5] = sq;
+        }
+        __syncthreads();
+        for (int j = 0; j < n; ++j) {
+            const float ss = part[j][0] + part[j][1] + part[j][2] + part[j][3];
+            h[(tb + j) * C + c] = h[(tb + j) * C + c] * rsqrtf(ss + eps);
+        }
+        __syncthreads();
+    }
+}
+#endif
 // the history after the chunk: its last three inputs (the older history where the chunk is shorter than 3)
 __global__ void gdn_conv_hist_kernel(float* __restrict__ hist, const float* __restrict__ qkv, int64_t T) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -745,11 +786,12 @@ __device__ __forceinline__ void gdn_cp_wait_prev() {   // every group but the ne
 #endif
 }
 constexpr int GDN_TB = 8, VPK = HV / HK;   // tokens per staged block, value heads per key head
+template<int TB>
 __global__ void __launch_bounds__(CB * RG) gdn_rec_kh_kernel(float* __restrict__ state, const float* __restrict__ h,
                                                                const float* __restrict__ gate,
                                                                const float* __restrict__ beta,
                                                                float* __restrict__ oc_out, int64_t T) {
-    constexpr int TB = GDN_TB, NT = CB * RG, QKP = S / 4, VP = CB / 4;   // threads, 16-byte pieces of a q/k row, of v
+    constexpr int NT = CB * RG, QKP = S / 4, VP = CB / 4;   // threads, 16-byte pieces of a q/k row, of v
     __shared__ __align__(16) float sq[2][TB][S];
     __shared__ __align__(16) float sk[2][TB][S];
     __shared__ __align__(16) float sv[2][TB][VPK][CB];
@@ -845,17 +887,26 @@ __global__ void __launch_bounds__(CB * RG) gdn_rec_kh_kernel(float* __restrict__
 // 64 SMs and more, 1.02-1.04x / 1.03-1.06x at 48 to 63 (two blocks against four: a draw, slower on neither),
 // 1.28-1.31x / 1.28-1.30x at 39 to 47, 1.53-1.57x / 1.54-1.55x at 32 to 38.  Per call, from the current device (a
 // layer split can mix cards).
-bool gdn_keyhead_ok() {
+bool gdn_stage16() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_GDN_STAGE_TOKENS");
+        return v && std::atoi(v) == 16;
+    }();
+    return on;
+}
+bool gdn_keyhead_ok(bool stage16) {
     static const bool off = [] { const char* v = std::getenv("STRATA_GDN_KEYHEAD"); return v != nullptr && std::atoi(v) == 0; }();
     if (off) return false;
-    static int known[64] = {};   // per device: 0 not asked yet, 1 yes, 2 no
+    static int cached[2][64] = {};   // per staging size and device
+    int* known = cached[stage16 ? 1 : 0];
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
     if (known[dev] == 0) {
         int major = 0, sms = 0, per_sm = 0;
         const bool yes = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
                          cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess && major >= 8 &&
-                         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, gdn_rec_kh_kernel, CB * RG, 0) ==
+                         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm,
+                             stage16 ? gdn_rec_kh_kernel<16> : gdn_rec_kh_kernel<GDN_TB>, CB * RG, 0) ==
                              cudaSuccess &&
                          (int64_t) per_sm * sms >= (int64_t) HK * NCB;
         if (!yes) cudaGetLastError();
@@ -1973,6 +2024,25 @@ __global__ void __launch_bounds__(S) gdn_out_norm_kernel(const float* __restrict
 }
 
 // ---------------------------------------------------------------- MoE
+#if !defined(__HIPCC__)
+// Adjacent CTAs visit adjacent rows rather than stepping over every value head.
+__global__ void __launch_bounds__(S) gdn_out_norm_flat_kernel(const float* __restrict__ z,
+        const float* __restrict__ gamma, float eps, const float* __restrict__ y,
+        uint16_t* __restrict__ y16, int64_t ld16) {
+    __shared__ float wsum[4];
+    const int64_t row = blockIdx.x, t = row / HV;
+    const int head = (int) (row % HV), col = threadIdx.x;
+    const size_t at = (size_t) row * S + col;
+    const float oc = y[at];
+    float sp = warp_sum(oc * oc);
+    if ((col & 31) == 0) wsum[col >> 5] = sp;
+    __syncthreads();
+    const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
+    const float v = oc * rsqrtf(ss / (float) S + eps) * gamma[col] * sigm(z[at]);
+    y16[(size_t) t * ld16 + (size_t) head * S + col] = hf(v);
+}
+#endif
+
 template <int REG>
 __global__ void route_kernel(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ wout,
                              int64_t T) {
@@ -2592,7 +2662,16 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
         gdn_conv_kernel<<<C / 128, 128, 0, (cudaStream_t) stream>>>(history, qkv, conv_w, h, T);
     } else {
         static const bool fused = [] { const char* v = std::getenv("STRATA_GDN_CONVL2"); return v && std::atoi(v) != 0; }();
+#if !defined(__HIPCC__)
+        static const bool rounded = [] { const char* v = std::getenv("STRATA_GDN_CONVL2"); return v && std::atoi(v) == 2; }();
+#endif
         if (fused) {
+#if !defined(__HIPCC__)
+            if (rounded)
+                gdn_conv_l2_rounded_kernel<<<dim3(C / 128, (unsigned) ((T + CONV_TILE - 1) / CONV_TILE)), 128, 0,
+                                             (cudaStream_t) stream>>>(history, qkv, conv_w, h, T, eps);
+            else
+#endif
             gdn_conv_l2_kernel<<<dim3(C / 128, (unsigned) ((T + CONV_TILE - 1) / CONV_TILE)), 128, 0,
                                  (cudaStream_t) stream>>>(history, qkv, conv_w, h, T, eps);
             gdn_conv_hist_kernel<<<C / 128, 128, 0, (cudaStream_t) stream>>>(history, qkv, T);
@@ -2709,15 +2788,28 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
         // STRATA_GDN_CHUNKED=1 (opt-in): the recurrence in chunks for prompt chunks of kGdnChunkedMin+ tokens (other
         // bits; a shorter chunk, a card it does not fit or a failed scratch allocation takes the kernels below)
         static const bool chunked = [] { const char* v = std::getenv("STRATA_GDN_CHUNKED"); return v != nullptr && std::atoi(v) != 0; }();
-        if (chunked && T >= kGdnChunkedMin && gdn_rec_chunked(state, h, gate, beta, y, T, (cudaStream_t) stream) == cudaSuccess) {
-        } else if (pipe && gdn_keyhead_ok())   // the value heads of a key head in one thread (same bits)
-            gdn_rec_kh_kernel<<<HK * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
-        else
+        const bool stage16 = pipe && (gdn_stage16() || variant == 6) && gdn_keyhead_ok(true);
+        cudaError_t chunk_status = cudaErrorNotSupported;
+        const bool use_chunked = chunked && T >= kGdnChunkedMin &&
+            (chunk_status = gdn_rec_chunked(state, h, gate, beta, y, T, (cudaStream_t) stream)) == cudaSuccess;
+        if (use_chunked) {
+        } else if (pipe && (stage16 || gdn_keyhead_ok(false))) {
+            if (stage16)
+                gdn_rec_kh_kernel<16><<<HK * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
+            else
+                gdn_rec_kh_kernel<GDN_TB><<<HK * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
+        } else
 #endif
         if (pipe)   // the software-pipelined loads (same bits)
             gdn_rec_cols_pipe_kernel<<<HV * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
         else
             gdn_rec_cols_kernel<<<HV * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
+#if !defined(__HIPCC__)
+        const char* flat_norm = std::getenv("STRATA_GDN_NORM_FLAT");
+        if (flat_norm && flat_norm[0] == '1')
+            gdn_out_norm_flat_kernel<<<(unsigned) (T * HV), S, 0, (cudaStream_t) stream>>>(z, gamma, eps, y, y16, ld16);
+        else
+#endif
         gdn_out_norm_kernel<<<dim3((unsigned) T, HV), S, 0, (cudaStream_t) stream>>>(z, gamma, eps, y, y16, ld16);
     }
     check("gdn_recurrence");
