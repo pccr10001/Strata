@@ -282,6 +282,10 @@ __device__ __forceinline__ void gdn_q8_1_store(GdnQ81* __restrict__ xq, size_t i
     if (idx % 32 == 0) xq[idx / 32].ds = q8_1_ds(d, sum);   // #606: clamped (the QFUSE path bypassed the finite helper)
 }
 
+#if defined(__HIPCC__)
+#include "gdn_t1_commit_early_hip.cuh"
+#endif
+
 template <bool ALL_OUT, bool Q>
 __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __restrict__ state,
                                                                      const float* __restrict__ hbuf, int C,
@@ -1150,6 +1154,18 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
     }
     const dim3 g1((unsigned) h_v), b1(S, RG);
     const bool all_out = n_keep == nullptr && t_out_begin <= 0;
+#if defined(__HIPCC__)
+    static const bool t1_early = [] {
+        const char* v = std::getenv("STRATA_GDN_T1_COMMIT_EARLY");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    if (t1_early && n_tok == 1 && n_keep != nullptr && t_out_begin == 0 && xq != nullptr) {
+        gdn_t1_commit_early_kernel<<<g1, b1, 0, (cudaStream_t) stream>>>(
+            state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_keep, xq);
+        check("gdn_t1_commit_early");
+        return;
+    }
+#endif
     if (xq && t_out_begin < n_tok) {
         if (all_out) gdn_step_norm_multi_kernel<true, true><<<g1, b1, 0, (cudaStream_t) stream>>>(
             state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, nullptr, 0, xq);

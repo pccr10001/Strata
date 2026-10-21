@@ -477,6 +477,113 @@ __global__ void __launch_bounds__(256) kernel_bk64(const _Float16* __restrict__ 
         }
 #endif
 }
+__global__ void __launch_bounds__(256) kernel_bk64_ep(const _Float16* __restrict__ X, const _Float16* __restrict__ W,
+                                                   float* __restrict__ Y, int M, int N, int K, int ldy, int accumulate,
+                                                   int ldx, int ldw) {
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__)
+    constexpr int BN = 256, WN = 64, BK64 = 64, LDK64 = BK64 + 8;
+    __shared__ __align__(16) _Float16 sA[BM][LDK64];
+    __shared__ __align__(16) _Float16 sB[BN][LDK64];
+    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, l16 = lane & 15, hi = lane >> 4;
+    const int wm = wave & 1, wn = wave >> 1;
+    const int num_m = (M + BM - 1) / BM, num_n = (N + BN - 1) / BN, b = blockIdx.x;
+    const int group = b / (GM * num_n), first_m = group * GM, gsize = min(GM, num_m - first_m);
+    const int m0 = (first_m + (b % (GM * num_n)) % gsize) * BM, n0 = ((b % (GM * num_n)) / gsize) * BN;
+    const int sr = tid >> 3, sq = tid & 7;            // 32 rows per pass, 8 x 8 halves per row
+    auto ldA = [&](int k0, int r) -> uint4 {
+        return *reinterpret_cast<const uint4*>(X + (size_t) min(m0 + r, M - 1) * ldx + k0 + 8 * sq);
+    };
+    auto ldB = [&](int k0, int r) -> uint4 {
+        return *reinterpret_cast<const uint4*>(W + (size_t) min(n0 + r, N - 1) * ldw + k0 + 8 * sq);
+    };
+    uint4 ra0, ra1, ra2, ra3, rb0, rb1, rb2, rb3, rb4, rb5, rb6, rb7;
+    auto load = [&](int k0) {
+        ra0 = ldA(k0, sr); ra1 = ldA(k0, sr + 32); ra2 = ldA(k0, sr + 64); ra3 = ldA(k0, sr + 96);
+        rb0 = ldB(k0, sr); rb1 = ldB(k0, sr + 32); rb2 = ldB(k0, sr + 64); rb3 = ldB(k0, sr + 96);
+        rb4 = ldB(k0, sr + 128); rb5 = ldB(k0, sr + 160); rb6 = ldB(k0, sr + 192); rb7 = ldB(k0, sr + 224);
+    };
+    auto store = [&]() {
+        *reinterpret_cast<uint4*>(&sA[sr][8 * sq]) = ra0; *reinterpret_cast<uint4*>(&sA[sr + 32][8 * sq]) = ra1;
+        *reinterpret_cast<uint4*>(&sA[sr + 64][8 * sq]) = ra2; *reinterpret_cast<uint4*>(&sA[sr + 96][8 * sq]) = ra3;
+        *reinterpret_cast<uint4*>(&sB[sr][8 * sq]) = rb0; *reinterpret_cast<uint4*>(&sB[sr + 32][8 * sq]) = rb1;
+        *reinterpret_cast<uint4*>(&sB[sr + 64][8 * sq]) = rb2; *reinterpret_cast<uint4*>(&sB[sr + 96][8 * sq]) = rb3;
+        *reinterpret_cast<uint4*>(&sB[sr + 128][8 * sq]) = rb4; *reinterpret_cast<uint4*>(&sB[sr + 160][8 * sq]) = rb5;
+        *reinterpret_cast<uint4*>(&sB[sr + 192][8 * sq]) = rb6; *reinterpret_cast<uint4*>(&sB[sr + 224][8 * sq]) = rb7;
+    };
+    f8 acc[4][4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) acc[i][j] = f8{0, 0, 0, 0, 0, 0, 0, 0};
+    load(0);
+    store();
+    __syncthreads();
+    const int ar = 64 * wm + l16, br = WN * wn + l16;
+    for (int k0 = 0; k0 < K; k0 += BK64) {
+        const bool more = k0 + BK64 < K;
+        if (more) load(k0 + BK64);
+#pragma unroll
+        for (int ks = 0; ks < BK64; ks += 16) {
+            const h16 a0 = frag(&sA[ar][ks]), a1 = frag(&sA[ar + 16][ks]), a2 = frag(&sA[ar + 32][ks]),
+                      a3 = frag(&sA[ar + 48][ks]);
+            const h16 b0 = frag(&sB[br][ks]), b1 = frag(&sB[br + 16][ks]), b2 = frag(&sB[br + 32][ks]),
+                      b3 = frag(&sB[br + 48][ks]);
+#define PFG_ROW(i, a)                                                                                                 \
+    acc[i][0] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b0, acc[i][0]);                                         \
+    acc[i][1] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b1, acc[i][1]);                                         \
+    acc[i][2] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b2, acc[i][2]);                                         \
+    acc[i][3] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b3, acc[i][3]);
+            PFG_ROW(0, a0) PFG_ROW(1, a1) PFG_ROW(2, a2) PFG_ROW(3, a3)
+#undef PFG_ROW
+        }
+        if (more) {
+            __syncthreads();   // every wave is done reading the tile
+            store();
+            __syncthreads();
+        }
+    }
+
+    // Matrix reads from every wave finish before the activation LDS is reused.
+    static_assert(sizeof(sA)>=8*16*36*sizeof(float));
+    __syncthreads();
+    float* ep = reinterpret_cast<float*>(sA) + wave*16*36;
+#pragma unroll
+    for(int i=0;i<4;++i) {
+#pragma unroll
+        for(int jp=0;jp<2;++jp) {
+#pragma unroll
+            for(int q=0;q<2;++q)
+#pragma unroll
+                for(int e=0;e<8;++e)
+                    ep[(2*e+hi)*36+q*16+l16] = acc[i][jp*2+q][e];
+            __builtin_amdgcn_wave_barrier();
+#pragma unroll
+            for(int phase=0;phase<4;++phase) {
+                const int flat=(phase*32+lane)*4;
+                const int m=m0+64*wm+16*i+flat/32;
+                const int n=n0+WN*wn+32*jp+flat%32;
+                if(m<M) {
+                    const float4 v=*reinterpret_cast<const float4*>(ep+(flat/32)*36+flat%32);
+                    float* out=Y+size_t(m)*ldy+n;
+                    if((reinterpret_cast<uintptr_t>(out)&15)==0 && n+4<=N) {
+                        if(accumulate) {
+                            const float4 old=*reinterpret_cast<const float4*>(out);
+                            *reinterpret_cast<float4*>(out)=make_float4(old.x+v.x,old.y+v.y,old.z+v.z,old.w+v.w);
+                        } else *reinterpret_cast<float4*>(out)=v;
+                    } else {
+                        const float values[4]={v.x,v.y,v.z,v.w};
+#pragma unroll
+                        for(int q=0;q<4;++q)if(n+q<N)
+                            out[q]=accumulate?out[q]+values[q]:values[q];
+                    }
+                }
+            }
+            __builtin_amdgcn_wave_barrier();
+        }
+    }
+#endif
+}
+
 // S23 (STRATA_PF_HCDOWN=1): the hyper-connection read's down (N nd = 320) and inject (N ni = 4) projections of xn16
 // (BF16, T x 10240, token stride ldx: 10240 + 64 avoids the 4 KB-multiple stride) as ONE GEMM - weight rows
 // [w_down; w_inject] read from the two tensors, the epilogue splitting the columns into lo (T x nd) and inj (T x ni),
@@ -489,6 +596,7 @@ __device__ __forceinline__ hb16 bfrag(const uint16_t* p) {
     const uint32_t w[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
     return __builtin_bit_cast(hb16, w);
 }
+template<bool TailGuard = false, int GroupM = GM>
 __global__ void __launch_bounds__(256) kernel_hcdown(const uint16_t* __restrict__ X, int ldx,
                                                      const uint16_t* __restrict__ Wd, const uint16_t* __restrict__ Wi,
                                                      int nd, int ni, float* __restrict__ lo, float* __restrict__ inj,
@@ -501,8 +609,8 @@ __global__ void __launch_bounds__(256) kernel_hcdown(const uint16_t* __restrict_
     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, l16 = lane & 15, hi = lane >> 4;
     const int wm = wave & 1, wn = wave >> 1;
     const int num_m = (M + BM - 1) / BM, num_n = (N + BN - 1) / BN, b = blockIdx.x;
-    const int group = b / (GM * num_n), first_m = group * GM, gsize = min(GM, num_m - first_m);
-    const int m0 = (first_m + (b % (GM * num_n)) % gsize) * BM, n0 = ((b % (GM * num_n)) / gsize) * BN;
+    const int group = b / (GroupM * num_n), first_m = group * GroupM, gsize = min(GroupM, num_m - first_m);
+    const int m0 = (first_m + (b % (GroupM * num_n)) % gsize) * BM, n0 = ((b % (GroupM * num_n)) / gsize) * BN;
     const int sr = tid >> 3, sq = tid & 7;
     auto ldA = [&](int k0, int r) -> uint4 {
         return *reinterpret_cast<const uint4*>(X + (size_t) min(m0 + r, M - 1) * ldx + k0 + 8 * sq);
@@ -537,17 +645,21 @@ __global__ void __launch_bounds__(256) kernel_hcdown(const uint16_t* __restrict_
         if (more) load(k0 + BK64);
 #pragma unroll
         for (int ks = 0; ks < BK64; ks += 16) {
-            const hb16 a0 = bfrag(&sA[ar][ks]), a1 = bfrag(&sA[ar + 16][ks]), a2 = bfrag(&sA[ar + 32][ks]),
-                       a3 = bfrag(&sA[ar + 48][ks]);
-            const hb16 b0 = bfrag(&sB[br][ks]), b1 = bfrag(&sB[br + 16][ks]);
-            acc[0][0] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b0, acc[0][0]);
-            acc[1][0] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b0, acc[1][0]);
-            acc[2][0] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a2, b0, acc[2][0]);
-            acc[3][0] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a3, b0, acc[3][0]);
-            acc[0][1] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b1, acc[0][1]);
-            acc[1][1] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b1, acc[1][1]);
-            acc[2][1] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a2, b1, acc[2][1]);
-            acc[3][1] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a3, b1, acc[3][1]);
+            // Every lane in a wave owns the same output tile; barriers stay outside.
+            if (!TailGuard || n0 + WN * wn < N) {
+                const hb16 a0 = bfrag(&sA[ar][ks]), a1 = bfrag(&sA[ar + 16][ks]),
+                           a2 = bfrag(&sA[ar + 32][ks]), a3 = bfrag(&sA[ar + 48][ks]);
+#pragma unroll
+                for (int j = 0; j < TN; ++j) {
+                    if (!TailGuard || n0 + WN * wn + 16 * j < N) {
+                        const hb16 b = bfrag(&sB[br + 16 * j][ks]);
+                        acc[0][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b, acc[0][j]);
+                        acc[1][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b, acc[1][j]);
+                        acc[2][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a2, b, acc[2][j]);
+                        acc[3][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a3, b, acc[3][j]);
+                    }
+                }
+            }
         }
         if (more) {
             __syncthreads();
@@ -572,6 +684,8 @@ __global__ void __launch_bounds__(256) kernel_hcdown(const uint16_t* __restrict_
         }
 #endif
 }
+
+#include "hcdown_silu_hip.cuh"
 
 // S23/S (STRATA_HCD_EXACT=1): the HC down projection (N 320, K 10240, BF16 in, FP32 out) bitwise equal to hipBLASLt
 // solution 1176 / 1177 (MT32x96 / MT96x96, StaggerU 32, stride 256 B): every output is the k tiles of 32 accumulated in
@@ -648,6 +762,150 @@ __global__ void __launch_bounds__(HX_NT) kernel_hcd_exact(const uint16_t* __rest
         }
 #endif
 }
+__device__ __forceinline__ float ssm_conv4(float4 w,float a,float b,float c,float d) {
+    const float s=__fmaf_rn(d,w.w,__fmaf_rn(c,w.z,__fmaf_rn(a,w.x,__fmul_rn(b,w.y))));
+    return s/(1.0f+__expf(-s));
+}
+__global__ void __launch_bounds__(256) kernel_bk64_ssm(const _Float16* __restrict__ X, const _Float16* __restrict__ W,
+                                                   float* __restrict__ Y, int M, int N, int K, int ldy, int accumulate,
+                                                   int ldx, int ldw, const float* __restrict__ conv_w, float* __restrict__ h) {
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__)
+    constexpr int BN = 256, WN = 64, BK64 = 64, LDK64 = BK64 + 8;
+    __shared__ __align__(16) _Float16 sA[BM][LDK64];
+    __shared__ __align__(16) _Float16 sB[BN][LDK64];
+    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, l16 = lane & 15, hi = lane >> 4;
+    const int wm = wave & 1, wn = wave >> 1;
+    const int num_m = (M + BM - 1) / BM, num_n = (N + BN - 1) / BN, b = blockIdx.x;
+    const int group = b / (GM * num_n), first_m = group * GM, gsize = min(GM, num_m - first_m);
+    const int m0 = (first_m + (b % (GM * num_n)) % gsize) * BM, n0 = ((b % (GM * num_n)) / gsize) * BN;
+    const int sr = tid >> 3, sq = tid & 7;            // 32 rows per pass, 8 x 8 halves per row
+    auto ldA = [&](int k0, int r) -> uint4 {
+        return *reinterpret_cast<const uint4*>(X + (size_t) min(m0 + r, M - 1) * ldx + k0 + 8 * sq);
+    };
+    auto ldB = [&](int k0, int r) -> uint4 {
+        return *reinterpret_cast<const uint4*>(W + (size_t) min(n0 + r, N - 1) * ldw + k0 + 8 * sq);
+    };
+    uint4 ra0, ra1, ra2, ra3, rb0, rb1, rb2, rb3, rb4, rb5, rb6, rb7;
+    auto load = [&](int k0) {
+        ra0 = ldA(k0, sr); ra1 = ldA(k0, sr + 32); ra2 = ldA(k0, sr + 64); ra3 = ldA(k0, sr + 96);
+        rb0 = ldB(k0, sr); rb1 = ldB(k0, sr + 32); rb2 = ldB(k0, sr + 64); rb3 = ldB(k0, sr + 96);
+        rb4 = ldB(k0, sr + 128); rb5 = ldB(k0, sr + 160); rb6 = ldB(k0, sr + 192); rb7 = ldB(k0, sr + 224);
+    };
+    auto store = [&]() {
+        *reinterpret_cast<uint4*>(&sA[sr][8 * sq]) = ra0; *reinterpret_cast<uint4*>(&sA[sr + 32][8 * sq]) = ra1;
+        *reinterpret_cast<uint4*>(&sA[sr + 64][8 * sq]) = ra2; *reinterpret_cast<uint4*>(&sA[sr + 96][8 * sq]) = ra3;
+        *reinterpret_cast<uint4*>(&sB[sr][8 * sq]) = rb0; *reinterpret_cast<uint4*>(&sB[sr + 32][8 * sq]) = rb1;
+        *reinterpret_cast<uint4*>(&sB[sr + 64][8 * sq]) = rb2; *reinterpret_cast<uint4*>(&sB[sr + 96][8 * sq]) = rb3;
+        *reinterpret_cast<uint4*>(&sB[sr + 128][8 * sq]) = rb4; *reinterpret_cast<uint4*>(&sB[sr + 160][8 * sq]) = rb5;
+        *reinterpret_cast<uint4*>(&sB[sr + 192][8 * sq]) = rb6; *reinterpret_cast<uint4*>(&sB[sr + 224][8 * sq]) = rb7;
+    };
+    f8 acc[4][4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) acc[i][j] = f8{0, 0, 0, 0, 0, 0, 0, 0};
+    load(0);
+    store();
+    __syncthreads();
+    const int ar = 64 * wm + l16, br = WN * wn + l16;
+    for (int k0 = 0; k0 < K; k0 += BK64) {
+        const bool more = k0 + BK64 < K;
+        if (more) load(k0 + BK64);
+#pragma unroll
+        for (int ks = 0; ks < BK64; ks += 16) {
+            const h16 a0 = frag(&sA[ar][ks]), a1 = frag(&sA[ar + 16][ks]), a2 = frag(&sA[ar + 32][ks]),
+                      a3 = frag(&sA[ar + 48][ks]);
+            const h16 b0 = frag(&sB[br][ks]), b1 = frag(&sB[br + 16][ks]), b2 = frag(&sB[br + 32][ks]),
+                      b3 = frag(&sB[br + 48][ks]);
+#define PFG_ROW(i, a)                                                                                                 \
+    acc[i][0] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b0, acc[i][0]);                                         \
+    acc[i][1] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b1, acc[i][1]);                                         \
+    acc[i][2] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b2, acc[i][2]);                                         \
+    acc[i][3] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b3, acc[i][3]);
+            PFG_ROW(0, a0) PFG_ROW(1, a1) PFG_ROW(2, a2) PFG_ROW(3, a3)
+#undef PFG_ROW
+        }
+        if (more) {
+            __syncthreads();   // every wave is done reading the tile
+            store();
+            __syncthreads();
+        }
+    }
+
+    // All GEMM readers finish before the weight LDS becomes a 32-token transpose.
+    static_assert(sizeof(sB) >= 8*32*36*sizeof(float));
+    __syncthreads();
+    float* ep = reinterpret_cast<float*>(sB) + wave*32*36;
+#pragma unroll
+    for(int ip=0;ip<2;++ip) {
+#pragma unroll
+        for(int jp=0;jp<2;++jp) {
+#pragma unroll
+            for(int g=0;g<2;++g)
+#pragma unroll
+                for(int q=0;q<2;++q)
+#pragma unroll
+                    for(int e=0;e<8;++e)
+                        ep[(16*g+2*e+hi)*36+q*16+l16] = acc[ip*2+g][jp*2+q][e];
+            __builtin_amdgcn_wave_barrier();
+#pragma unroll
+            for(int phase=0;phase<8;++phase) {
+                const int flat=(phase*32+lane)*4;
+                const int tl=flat/32;
+                const int m=m0+64*wm+32*ip+tl;
+                const int n=n0+WN*wn+32*jp+flat%32;
+                if(m<M && n+4<=N) {
+                    const float4 v=*reinterpret_cast<const float4*>(ep+tl*36+flat%32);
+                    if(tl<3 || tl>=29 || m+3>=M)
+                        *reinterpret_cast<float4*>(Y+size_t(m)*ldy+n)=v;
+                    if(tl>=3) {
+                        const float4 a=*reinterpret_cast<const float4*>(ep+(tl-3)*36+flat%32);
+                        const float4 b=*reinterpret_cast<const float4*>(ep+(tl-2)*36+flat%32);
+                        const float4 c=*reinterpret_cast<const float4*>(ep+(tl-1)*36+flat%32);
+                        const float4 w0=*reinterpret_cast<const float4*>(conv_w+(n+0)*4);
+                        const float4 w1=*reinterpret_cast<const float4*>(conv_w+(n+1)*4);
+                        const float4 w2=*reinterpret_cast<const float4*>(conv_w+(n+2)*4);
+                        const float4 w3=*reinterpret_cast<const float4*>(conv_w+(n+3)*4);
+                        *reinterpret_cast<float4*>(h+size_t(m)*N+n)=make_float4(
+                            ssm_conv4(w0,a.x,b.x,c.x,v.x),ssm_conv4(w1,a.y,b.y,c.y,v.y),
+                            ssm_conv4(w2,a.z,b.z,c.z,v.z),ssm_conv4(w3,a.w,b.w,c.w,v.w));
+                    }
+                }
+            }
+            __builtin_amdgcn_wave_barrier();
+        }
+    }
+#endif
+}
+
+__global__ void ssm_boundary(const float* hist,const float* qkv,const float* w,float* h,int T) {
+    const int c=blockIdx.x*128+threadIdx.x,t=blockIdx.y*32+blockIdx.z;
+    if(t>=T)return;
+    float v[4];
+#pragma unroll
+    for(int i=0;i<4;++i) {const int src=t-3+i;v[i]=src<0?hist[c*3+src+3]:qkv[size_t(src)*10240+c];}
+    h[size_t(t)*10240+c]=ssm_conv4(*reinterpret_cast<const float4*>(w+c*4),v[0],v[1],v[2],v[3]);
+}
+__global__ void ssm_norm(float* h,int T,float eps) {
+    const int c=blockIdx.x*128+threadIdx.x,t=blockIdx.y;
+    const float v=h[size_t(t)*10240+c];
+    float sq=__fmaf_rn(v,v,__shfl_xor(__fmul_rn(v,v),16));
+#pragma unroll
+    for(int o=8;o>0;o>>=1)sq=__fadd_rn(sq,__shfl_xor(sq,o));
+    __shared__ float part[4];
+    if((threadIdx.x&31)==0)part[threadIdx.x>>5]=sq;
+    __syncthreads();
+    const float ss=((part[0]+part[1])+part[2])+part[3];
+    h[size_t(t)*10240+c]=v*rsqrtf(ss+eps);
+}
+__global__ void ssm_history(float* hist,const float* qkv,int T) {
+    const int c=blockIdx.x*128+threadIdx.x;
+#pragma unroll
+    for(int i=0;i<3;++i)hist[c*3+i]=qkv[size_t(T-3+i)*10240+c];
+}
+
+#include "dense_ssm_l2_hip.cuh"
+
 }  // namespace pfg
 
 bool strata_pf_hcdown_bf16(const uint16_t* X, int64_t ldx, const uint16_t* Wd, const uint16_t* Wi, int64_t nd,
@@ -657,9 +915,52 @@ bool strata_pf_hcdown_bf16(const uint16_t* X, int64_t ldx, const uint16_t* Wd, c
     if (!strata_wmma_gfx11_device()) return false;
     const int64_t mt = (T + pfg::BM - 1) / pfg::BM;
     const unsigned grid = (unsigned) (mt * ((nd + ni + 127) / 128));
-    pfg::kernel_hcdown<<<grid, 256, 0, static_cast<hipStream_t>(stream)>>>(X, (int) ldx, Wd, Wi, (int) nd, (int) ni,
-                                                                            lo, inj, (int) T, (int) K);
+    static const bool group_one = [] { const char* e = std::getenv("STRATA_PF_HCDOWN_GM1"); return e && e[0] == '1'; }();
+    if (group_one && T >= 8192) {
+        pfg::kernel_hcdown<true, 1><<<grid, 256, 0, static_cast<hipStream_t>(stream)>>>(
+            X, (int) ldx, Wd, Wi, (int) nd, (int) ni, lo, inj, (int) T, (int) K);
+        return hipGetLastError() == hipSuccess;
+    }
+    static const bool tail_guard = [] { const char* e = std::getenv("STRATA_PF_HCDOWN_TAIL"); return e && e[0] == '1'; }();
+    if (tail_guard)
+        pfg::kernel_hcdown<true><<<grid, 256, 0, static_cast<hipStream_t>(stream)>>>(X, (int) ldx, Wd, Wi, (int) nd, (int) ni,
+                                                                                lo, inj, (int) T, (int) K);
+    else
+        pfg::kernel_hcdown<false><<<grid, 256, 0, static_cast<hipStream_t>(stream)>>>(X, (int) ldx, Wd, Wi, (int) nd, (int) ni,
+                                                                                 lo, inj, (int) T, (int) K);
     return hipGetLastError() == hipSuccess;
+}
+
+
+int strata_pf_hcdown_silu_bf16(const uint16_t* X, int64_t ldx, const uint16_t* Wd,
+                              const uint16_t* Wi, uint16_t* lo16, float* inj,
+                              int64_t T, void* stream) {
+    static const bool on = [] { const char* e = std::getenv("STRATA_HC_DOWN_SILU"); return e && e[0] == '1'; }();
+    if (!on) return 0;
+    if (hipPeekAtLastError() != hipSuccess) return -1;
+    static const bool tail = [] { const char* e = std::getenv("STRATA_PF_HCDOWN_TAIL"); return e && e[0] == '1'; }();
+    static const bool gm1 = [] { const char* e = std::getenv("STRATA_PF_HCDOWN_GM1"); return e && e[0] == '1'; }();
+    if (!tail || gm1 || T < 4096 || T > (1LL << 30) || ldx != 10240 + 64 ||
+        !X || !Wd || !Wi || !lo16 || !inj ||
+        ((reinterpret_cast<uintptr_t>(X) | reinterpret_cast<uintptr_t>(Wd) |
+          reinterpret_cast<uintptr_t>(Wi) | reinterpret_cast<uintptr_t>(lo16) |
+          reinterpret_cast<uintptr_t>(inj)) & 15)) return 0;
+    int device = 0;
+    if (hipGetDevice(&device) != hipSuccess) return -1;
+    if (device < 0 || device >= 64) return 0;
+    static std::atomic<int> arch[64];
+    int match = arch[device].load(std::memory_order_acquire);
+    if (!match) {
+        hipDeviceProp_t prop{};
+        if (hipGetDeviceProperties(&prop, device) != hipSuccess) return -1;
+        match = strata::kernels::gfx_arch_is_gfx1151(prop.gcnArchName) ? 1 : 2;
+        arch[device].store(match, std::memory_order_release);
+    }
+    if (match != 1) return 0;
+    const unsigned grid = unsigned(((T + 127) / 128) * 3);
+    pfg::kernel_hcdown_silu<true><<<grid, 256, 0, static_cast<hipStream_t>(stream)>>>(
+        X, int(ldx), Wd, Wi, 320, 4, nullptr, inj, int(T), 10240, lo16);
+    return hipPeekAtLastError() == hipSuccess ? 1 : -1;
 }
 
 bool strata_pf_hcdown_exact_bf16(const uint16_t* X, int64_t ldx, const uint16_t* W, float* Y, int64_t T, int64_t N,
@@ -678,14 +979,21 @@ bool strata_pf_gemm_f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t 
     return strata_pf_gemm_f16_ld(X, K, W, K, Y, T, N, K, ldy, beta, stream);
 }
 
-bool strata_pf_gemm_f16_ld(const uint16_t* X, int64_t ldx, const uint16_t* W, int64_t ldw, float* Y, int64_t T,
-                           int64_t N, int64_t K, int64_t ldy, float beta, void* stream) {
-    if (!X || !W || !Y || T < 64 || N < 512 || K % pfg::BK != 0 || K < pfg::BK) return false;
+bool strata_pf_gemm_f16_ld_supported(int64_t T, int64_t N, int64_t K, int64_t ldx, int64_t ldw,
+                                      int64_t ldy, float beta) {
+    if (T < 64 || N < 512 || K % pfg::BK != 0 || K < pfg::BK) return false;
     if (beta != 0.0f && beta != 1.0f) return false;
     if (ldy <= 0) ldy = N;
     if (ldx < K || ldw < K || ldx % 8 != 0 || ldw % 8 != 0 || ldx > (1LL << 30) || ldw > (1LL << 30)) return false;
     if (ldy < N || T > (1LL << 30) || N > (1LL << 30) || K > (1LL << 30)) return false;
     if (!strata_wmma_gfx11_device()) return false;
+    return true;
+}
+
+int strata_pf_gemm_f16_ld_status(const uint16_t* X, int64_t ldx, const uint16_t* W, int64_t ldw, float* Y, int64_t T,
+                           int64_t N, int64_t K, int64_t ldy, float beta, void* stream) {
+    if (!X || !W || !Y || !strata_pf_gemm_f16_ld_supported(T, N, K, ldx, ldw, ldy, beta)) return 0;
+    if (ldy <= 0) ldy = N;
     hipStream_t s = static_cast<hipStream_t>(stream);
     const int acc = beta == 1.0f ? 1 : 0;
     const int64_t mt = (T + pfg::BM - 1) / pfg::BM;
@@ -693,6 +1001,11 @@ bool strata_pf_gemm_f16_ld(const uint16_t* X, int64_t ldx, const uint16_t* W, in
     static const bool bk64 = [] { const char* v = std::getenv("STRATA_PF_BK64"); return !v || v[0] != '0'; }();
     if (N >= 1024 && bk64 && K % 64 == 0) {
         const unsigned grid = (unsigned) (mt * ((N + 255) / 256));
+        static const bool ep=[] { const char* e=std::getenv("STRATA_PF_DENSE_EP"); return e && e[0]=='1'; }();
+        if(ep)
+            pfg::kernel_bk64_ep<<<grid,256,0,s>>>((const _Float16*)X,(const _Float16*)W,Y,(int)T,(int)N,(int)K,
+                                                (int)ldy,acc,(int)ldx,(int)ldw);
+        else
         pfg::kernel_bk64<<<grid, 256, 0, s>>>((const _Float16*) X, (const _Float16*) W, Y, (int) T, (int) N, (int) K,
                                               (int) ldy, acc, (int) ldx, (int) ldw);
     } else if (N >= 1024) {
@@ -704,14 +1017,98 @@ bool strata_pf_gemm_f16_ld(const uint16_t* X, int64_t ldx, const uint16_t* W, in
         pfg::kernel<128, 32><<<grid, 256, 0, s>>>((const _Float16*) X, (const _Float16*) W, Y, (int) T, (int) N, (int) K,
                                                   (int) ldy, acc, (int) ldx, (int) ldw);
     }
-    return hipGetLastError() == hipSuccess;
+    return hipGetLastError() == hipSuccess ? 1 : -1;
 }
+bool strata_pf_gemm_f16_ld(const uint16_t* X, int64_t ldx, const uint16_t* W, int64_t ldw, float* Y, int64_t T,
+                           int64_t N, int64_t K, int64_t ldy, float beta, void* stream) {
+    return strata_pf_gemm_f16_ld_status(X, ldx, W, ldw, Y, T, N, K, ldy, beta, stream) == 1;
+}
+
+int strata_pf_dense_ssm_conv(const uint16_t* X, int64_t ldx, const uint16_t* W, int64_t ldw,
+                             float* qkv, const float* conv_w, float* history, float* h,
+                             int64_t T, int64_t N, int64_t K, float eps, void* stream) {
+    if (!X || !W || !qkv || !conv_w || !history || !h || T <= 64 || T > (1LL << 30) ||
+        N != 10240 || K != 2560 || ldx < K || ldw < K || ldx % 8 || ldw % 8 ||
+        ldx > (1LL << 30) || ldw > (1LL << 30) ||
+        ((reinterpret_cast<uintptr_t>(X) | reinterpret_cast<uintptr_t>(W) | reinterpret_cast<uintptr_t>(qkv) |
+          reinterpret_cast<uintptr_t>(conv_w) | reinterpret_cast<uintptr_t>(h)) & 15) ||
+        !strata_wmma_gfx11_device()) return 0;
+    const hipStream_t s = static_cast<hipStream_t>(stream);
+    static const bool fused_l2 = [] {
+        const char* value = std::getenv("STRATA_PF_DENSE_SSM_CONV");
+        return value && value[0] == '2';
+    }();
+    // Only the large shape was measured faster with the larger norm epilogue.
+    if (fused_l2 && T >= 4096) {
+        pfg::ssm_l2::kernel_fused<<<(unsigned) (((T + 127) / 128) * 40), 256, 0, s>>>(
+            (const _Float16*) X, (const _Float16*) W, qkv, (int) T, 10240, 2560, 10240, 0,
+            (int) ldx, (int) ldw, conv_w, h, eps);
+        if (hipGetLastError() != hipSuccess) return -1;
+        pfg::ssm_l2::boundary<<<dim3(80, (unsigned) ((T + 31) / 32), 3), 128, 0, s>>>(
+            history, qkv, conv_w, h, (int) T, eps);
+        if (hipGetLastError() != hipSuccess) return -1;
+        pfg::ssm_history<<<80, 128, 0, s>>>(history, qkv, (int) T);
+        return hipGetLastError() == hipSuccess ? 1 : -1;
+    }
+    pfg::kernel_bk64_ssm<<<(unsigned) (((T + 127) / 128) * 40), 256, 0, s>>>(
+        (const _Float16*) X, (const _Float16*) W, qkv, (int) T, 10240, 2560, 10240, 0,
+        (int) ldx, (int) ldw, conv_w, h);
+    if (hipGetLastError() != hipSuccess) return -1;
+    pfg::ssm_boundary<<<dim3(80, (unsigned) ((T + 31) / 32), 3), 128, 0, s>>>(history, qkv, conv_w, h, (int) T);
+    if (hipGetLastError() != hipSuccess) return -1;
+    pfg::ssm_history<<<80, 128, 0, s>>>(history, qkv, (int) T);
+    if (hipGetLastError() != hipSuccess) return -1;
+    pfg::ssm_norm<<<dim3(32, (unsigned) T), 128, 0, s>>>(h, (int) T, eps);
+    return hipGetLastError() == hipSuccess ? 1 : -1;
+}
+
+#include "shared_up_swiglu_hip.cuh"
+
+bool strata_pf_shared_up_f16_supported(int64_t T, int64_t N, int64_t K, int64_t ldx, int64_t ldw) {
+    if (T < 4096 || T > (1LL << 30) || N != 640 || K != 2560 ||
+        ldx < K || ldw < K || ldx % 8 || ldw % 8 || ldx > (1LL << 30) || ldw > (1LL << 30)) return false;
+    static thread_local int last_device = -1;
+    static thread_local bool supported = false;
+    int device = 0;
+    if (hipGetDevice(&device) != hipSuccess) return false;
+    if (device != last_device) {
+        hipDeviceProp_t props{};
+        if (hipGetDeviceProperties(&props, device) != hipSuccess) return false;
+        supported = std::strncmp(props.gcnArchName, "gfx1151", 7) == 0 &&
+                    (props.gcnArchName[7] == 0 || props.gcnArchName[7] == ':');
+        last_device = device;
+    }
+    return supported;
+}
+
+int strata_pf_shared_up_f16(const uint16_t* X, int64_t ldx, const uint16_t* W, int64_t ldw,
+                             const float* gate, uint16_t* H, int64_t T, int64_t N, int64_t K, void* stream) {
+    if (hipPeekAtLastError() != hipSuccess) return -1;
+    if (!X || !W || !gate || !H || (reinterpret_cast<uintptr_t>(X) & 15) ||
+        (reinterpret_cast<uintptr_t>(W) & 15) || (reinterpret_cast<uintptr_t>(gate) & 3) ||
+        (reinterpret_cast<uintptr_t>(H) & 1) || !strata_pf_shared_up_f16_supported(T,N,K,ldx,ldw)) return 0;
+    shared_up_swiglu::kernel<128,32,true><<<(unsigned)(((T+127)/128)*5),256,0,(hipStream_t)stream>>>(
+        (const _Float16*)X,(const _Float16*)W,nullptr,(int)T,640,2560,640,0,(int)ldx,(int)ldw,gate,H);
+    return hipPeekAtLastError() == hipSuccess ? 1 : -1;
+}
+
 
 #else
 // Non-HIP / Non-GFX11 compilation fallback
+int strata_pf_hcdown_silu_bf16(const uint16_t*, int64_t, const uint16_t*,
+                              const uint16_t*, uint16_t*, float*,
+                              int64_t, void*) { return 0; }
+bool strata_pf_shared_up_f16_supported(int64_t,int64_t,int64_t,int64_t,int64_t) { return false; }
+int strata_pf_shared_up_f16(const uint16_t*,int64_t,const uint16_t*,int64_t,const float*,uint16_t*,
+                             int64_t,int64_t,int64_t,void*) { return 0; }
+int strata_pf_dense_ssm_conv(const uint16_t*, int64_t, const uint16_t*, int64_t, float*,
+                             const float*, float*, float*, int64_t, int64_t, int64_t, float, void*) { return 0; }
 bool strata_pf_gemm_f16(const uint16_t*, const uint16_t*, float*, int64_t, int64_t, int64_t, int64_t, float, void*) {
     return false;
 }
+bool strata_pf_gemm_f16_ld_supported(int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, float) { return false; }
+int strata_pf_gemm_f16_ld_status(const uint16_t*, int64_t, const uint16_t*, int64_t, float*, int64_t, int64_t, int64_t,
+                                int64_t, float, void*) { return 0; }
 bool strata_pf_gemm_f16_ld(const uint16_t*, int64_t, const uint16_t*, int64_t, float*, int64_t, int64_t, int64_t,
                            int64_t, float, void*) {
     return false;

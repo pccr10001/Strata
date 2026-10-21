@@ -48,3 +48,13 @@ void qsa_prompt_attn_set_imma(int on);
 bool qsa_prompt_attn_matrix_cores_requested();
 
 }  // namespace strata::kernels
+
+#if defined(STRATA_USE_HIP)
+namespace strata::kernels {
+// Default-off gfx1151 FAST attention+gate. 0: nothing launched; 1: queued; -1: terminal device/launch error.
+int qsa_prompt_attn_batch_gated(const float* q, const QsaAttnPools& pools, const int32_t* ids,
+                                const int32_t* steps, int64_t cap, const QsaShapes& s,
+                                const float* q_full, uint16_t* out16, int64_t n_q,
+                                int64_t ld16, bool rotated_or_hybrid, void* stream);
+}
+#endif

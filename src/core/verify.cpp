@@ -391,6 +391,20 @@ bool one_token_self_commit() {
 #endif
 }
 
+bool window_self_commits(int tokens, bool always_publish, bool batch) {
+#if defined(STRATA_USE_HIP)
+    static const bool qfuse_commit = [] {
+        const char* v = std::getenv("STRATA_QFUSE_ONE_TOKEN_COMMIT");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+#else
+    constexpr bool qfuse_commit = false;
+#endif
+    // The quantized recurrence can also keep state when passed one_. Capture and
+    // commit must use the same predicate so neither skips the only state update.
+    return tokens == 1 && !always_publish && !batch && (!g_qfuse() || qfuse_commit) && one_token_self_commit();
+}
+
 bool mapped(size_t bytes, void** h, void** d) {
 #if defined(STRATA_USE_HIP)
     if (g_coherent) {
@@ -1035,7 +1049,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
     const int G = (split_ && T >= 2 && !batch_rec_) ? 2 : 1;   // a batch window is one group
     // Pipelined windows must wait for the host verdict/snapshot fence before mutating state.
-    const bool self_commit = T == 1 && !always_publish_ && !batch_rec_ && !g_qfuse() && one_token_self_commit();   // see Verifier::commit
+    const bool self_commit = window_self_commits(T, always_publish_, batch_rec_);
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     // fork 34a35db: the GDN gates and the QSA indexer beside the projections (STRATA_SIDE_MIXER=1; 0 / unset = in line)
     const int side_mixer_mode = g_side_mixer();
@@ -3196,7 +3210,7 @@ bool Verifier::commit(int n_keep, std::string& err) {
     h_commit_[0] = n_keep;
     h_commit_[1] = n_keep - 1;
     for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
-    if (last_t_ == 1 && !always_publish_ && one_token_self_commit()) {
+    if (window_self_commits(last_t_, always_publish_, last_batch_)) {
         // a one-token window has advanced the state itself (record_window): no commit graph
     } else {
         std::atomic_thread_fence(std::memory_order_seq_cst);

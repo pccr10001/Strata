@@ -3,6 +3,7 @@
 
 #include <cstdint>
 
+
 /// Compute Y[t, n] = beta * Y[t, n] + sum_k W[n, k] * X[t, k] using RDNA3 WMMA instructions.
 /// X: T x K row-major (leading dim K), fp16 (uint16_t)
 /// W: N x K row-major (leading dim K), fp16 (uint16_t)
@@ -27,6 +28,10 @@ bool strata_pf_gemm_f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t 
 /// (n < ni) in one BF16 WMMA GEMM over X (T x K, token stride ldx >= K, a multiple of 8; Wd / Wi row-major, stride
 /// K); lo T x nd and inj T x ni, FP32.  K a multiple of 64, T >= 64.  False (nothing launched) otherwise / off gfx11.
 #if defined(STRATA_USE_HIP)
+// Opt-in exact BF16 SiLU after HC down. 0 means no launch, -1 is terminal, 1 queued.
+int strata_pf_hcdown_silu_bf16(const uint16_t* X, int64_t ldx, const uint16_t* Wd,
+                              const uint16_t* Wi, uint16_t* lo16, float* inj,
+                              int64_t T, void* stream = nullptr);
 bool strata_pf_hcdown_bf16(const uint16_t* X, int64_t ldx, const uint16_t* Wd, const uint16_t* Wi, int64_t nd,
                            int64_t ni, float* lo, float* inj, int64_t T, int64_t K, void* stream = nullptr);
 #else
@@ -45,3 +50,20 @@ bool strata_pf_gemm_f16_ld(const uint16_t* X, int64_t ldx, const uint16_t* W, in
 bool strata_wmma_gemm_bf16(const uint16_t* X, const uint16_t* W, float* Y,
                            int64_t T, int64_t N, int64_t K, int64_t ldy, float beta,
                            void* stream = nullptr);
+
+// Opt-in GDN projection/convolution. 0 means no projection was launched; -1 is a launch error (never fall back).
+int strata_pf_dense_ssm_conv(const uint16_t* X, int64_t ldx, const uint16_t* W, int64_t ldw,
+                             float* qkv, const float* conv_w, float* history, float* h,
+                             int64_t T, int64_t N, int64_t K, float eps, void* stream);
+
+// Cache opt-in: test eligibility before allocating, then distinguish unsupported from a launch error.
+bool strata_pf_gemm_f16_ld_supported(int64_t T, int64_t N, int64_t K, int64_t ldx, int64_t ldw,
+                                    int64_t ldy, float beta);
+// 0: unsupported before projection; 1: queued; -1: launch error, never fall back.
+int strata_pf_gemm_f16_ld_status(const uint16_t* X, int64_t ldx, const uint16_t* W, int64_t ldw, float* Y,
+                                int64_t T, int64_t N, int64_t K, int64_t ldy, float beta, void* stream);
+
+// 0: unsupported before any launch; 1: queued; -1: terminal launch error.
+bool strata_pf_shared_up_f16_supported(int64_t T, int64_t N, int64_t K, int64_t ldx, int64_t ldw);
+int strata_pf_shared_up_f16(const uint16_t* X, int64_t ldx, const uint16_t* W, int64_t ldw,
+                             const float* gate, uint16_t* H, int64_t T, int64_t N, int64_t K, void* stream);

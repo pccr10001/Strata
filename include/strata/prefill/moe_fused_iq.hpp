@@ -29,6 +29,13 @@ struct NativeGeom {
 /// enabled() (STRATA_PF_FUSED=1 on sm_80+), and the kernels cover this gate/up and down pair on this device.
 bool native_supported(int gu_type, int d_type);
 
+/// Opt-in gfx11 Q4/Q5 expert GEMMs with FP16 activations and FP32 accumulation.
+bool native_f16_supported(int gu_type, int d_type);
+/// Opt-in HIP intermediate rounding; the caller must pair it with a half-input combine.
+bool native_f16_half_down();
+void experts_native_f16(const Batch& b, const NativeGeom& g, int n_expert, const void* scratch,
+                        const uint16_t* x, const int32_t* src, void* h, float* dm, void* stream, bool half_down = false,
+                        int64_t input_stride = 0, int64_t tokens = 0);
 /// x [rows][cols] FP32 -> `xa` (act_bytes(rows, cols)): int8 per 32 values in natural order, the native kernels' form.
 void quantize_act_native(const float* x, int64_t rows, int64_t cols, void* xa, void* stream);
 

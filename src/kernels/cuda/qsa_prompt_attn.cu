@@ -2177,6 +2177,9 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
 #endif
 }
 
+#include "qsa_prompt_attn_gated_hip.cuh"
+#include "qsa_prompt_attn_p12_hip.cuh"
+
 // gfx12 (RDNA4): on by default on Linux (148-amd; STRATA_HIP_WMMA=0 turns it off; Windows: opt-in with =1 until tested there).  gfx11 (RDNA3 / RDNA3.5): only on request
 // (STRATA_HIP_WMMA=1).  STRATA_HIP_WMMA=auto (151-amd) takes the matrix-core kernel on a gfx12 card for a batch of
 // STRATA_HIP_WMMA_MIN_Q (64) or more queries and keeps the FP32 kernel for smaller calls.  The output differs from the
@@ -2431,4 +2434,59 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     return launch<0>(q, pools, ids, steps, cap, s, attn, n_q, st);
 }
 
+
+#if defined(__HIPCC__)
+int qsa_prompt_attn_batch_gated(const float* q, const QsaAttnPools& pools, const int32_t* ids,
+                                const int32_t* steps, int64_t cap, const QsaShapes& s,
+                                const float* q_full, uint16_t* out16, int64_t n_q,
+                                int64_t ld16, bool rotated_or_hybrid, void* stream) {
+    static const bool on = [] { const char* v = std::getenv("STRATA_PA_GATE_FUSED"); return v && v[0] == '1'; }();
+    if (!on) return 0;
+    // Preserve any earlier failure: a partially queued operation must never enter the fallback path.
+    if (hipPeekAtLastError() != hipSuccess) return -1;
+    static const bool fast = [] { const char* v = std::getenv("STRATA_PA_FAST"); return v && v[0] == '1'; }();
+    static const int64_t min_t = [] { const char* v = std::getenv("STRATA_PF_SWITCH_MIN_T"); return v ? std::atoll(v) : 0LL; }();
+    if (!fast || n_q < 4096 || n_q < min_t || n_q > (1LL << 30) || rotated_or_hybrid ||
+        ld16 != 6144 + 64 || !q || !q_full || !out16 || !ids || !steps || !pools.page_table ||
+        !pools.k_q || !pools.v_q || !pools.k_scale || !pools.v_scale ||
+        pools.k_pool || pools.v_pool || pools.k_q4 || pools.v_q4 ||
+        s.n_head != 24 || s.n_head_kv != 2 || s.head_dim != 256 || s.page_size <= 0 ||
+        s.page_size > (1LL << 30) || cap <= 0 || cap > (1LL << 30)) return 0;
+    if (((reinterpret_cast<uintptr_t>(q) | reinterpret_cast<uintptr_t>(q_full) |
+          reinterpret_cast<uintptr_t>(out16) | reinterpret_cast<uintptr_t>(pools.k_q) |
+          reinterpret_cast<uintptr_t>(pools.v_q)) & 15) ||
+        ((reinterpret_cast<uintptr_t>(ids) | reinterpret_cast<uintptr_t>(steps) |
+          reinterpret_cast<uintptr_t>(pools.page_table)) & 3) ||
+        ((reinterpret_cast<uintptr_t>(pools.k_scale) | reinterpret_cast<uintptr_t>(pools.v_scale)) & 1)) return 0;
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess) return -1;
+    if (dev < 0 || dev >= 64) return 0;
+    static std::atomic<int> arch[64];
+    int match = arch[dev].load(std::memory_order_acquire);
+    if (!match) {
+        hipDeviceProp_t prop{};
+        if (hipGetDeviceProperties(&prop, dev) != hipSuccess) return -1;
+        match = std::strncmp(prop.gcnArchName, "gfx1151", 7) == 0 ? 1 : 2;
+        arch[dev].store(match, std::memory_order_release);
+    }
+    if (match != 1 || !hip_wmma_usable(n_q, cap)) return hipPeekAtLastError() == hipSuccess ? 0 : -1;
+    static const bool p12 = [] { const char* v = std::getenv("STRATA_PA_P12"); return v && v[0] == '1'; }();
+    const float scale_log2 = 1.4426950408889634f / sqrtf(256.0f);
+    const auto st = static_cast<hipStream_t>(stream);
+    for (int64_t q0 = 0; q0 < n_q; q0 += 65535) {
+        const int64_t nb = std::min<int64_t>(65535, n_q - q0);
+        if (p12) {
+            prompt_attn_wmma_p12_kernel<false><<<dim3((unsigned) nb, 2), 128, 0, st>>>(
+                q + q0 * 6144, pools, ids + q0 * cap, steps + q0 * kStepCount, 2, (int) s.page_size,
+                scale_log2, nullptr, (int) cap, q_full + q0 * 12288, out16 + q0 * ld16, (int) ld16);
+        } else {
+            prompt_attn_wmma_gated_kernel<false><<<dim3((unsigned) nb, 2), 128, 0, st>>>(
+                q + q0 * 6144, pools, ids + q0 * cap, steps + q0 * kStepCount, 2, (int) s.page_size,
+                scale_log2, nullptr, (int) cap, q_full + q0 * 12288, out16 + q0 * ld16, (int) ld16);
+        }
+        if (hipPeekAtLastError() != hipSuccess) return -1;
+    }
+    return 1;
+}
+#endif
 }  // namespace strata::kernels

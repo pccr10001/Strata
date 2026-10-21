@@ -203,6 +203,53 @@ __global__ void __launch_bounds__(256) gr_write_norm_rs_kernel(float* __restrict
         if (xn16_lo) xn16_lo[xo + d] = bf_lo(x, h);
     }
 }
+#if defined(__HIPCC__)
+// Fixed row geometry; mode 2 also holds the input loads before residual stores.
+template <bool Prefetch>
+__global__ void __launch_bounds__(256) gr_write_norm_fixed_kernel(float* __restrict__ R, const float* __restrict__ bo,
+                                                               const float* __restrict__ inj, int64_t inj_ld,
+                                                               const float* __restrict__ w, float eps,
+                                                               float* __restrict__ rs_out, uint16_t* __restrict__ xn16,
+                                                               uint16_t* __restrict__ xn16_lo, int64_t ldx, int f16img) {
+    __shared__ float sh[32];
+    const int64_t row = blockIdx.x;                 // t * 4 + c
+    const int64_t t = row / HC;
+    const int c = (int) (row % HC);
+    float* r = R + row * N;
+    const int64_t xo = t * ldx + (int64_t) c * N;
+    const float sc = 2.0f * sigm(inj[t * inj_ld + c] / (float) HC);
+    float v[GRW_PER], input[GRW_PER], weight[GRW_PER];
+#pragma unroll
+    for (int k = 0; k < GRW_PER; ++k) {
+        if constexpr (Prefetch) {
+            const int d = threadIdx.x + 256 * k;
+            v[k] = r[d];
+            input[k] = bo[t * N + d];
+            weight[k] = w[c * N + d];
+        }
+    }
+    float ss = 0.0f;
+#pragma unroll
+    for (int k = 0; k < GRW_PER; ++k) {
+        const int d = threadIdx.x + 256 * k;
+        const float x = Prefetch ? fmaf(input[k], sc, v[k]) : fmaf(bo[t * N + d], sc, r[d]);
+        r[d] = x;
+        v[k] = x;
+        ss += x * x;
+    }
+    const float rs = rsqrtf(block_sum(ss, sh) / (float) N + eps);
+    if (threadIdx.x == 0) rs_out[row] = rs;
+#pragma unroll
+    for (int k = 0; k < GRW_PER; ++k) {
+        const int d = threadIdx.x + 256 * k;
+        const float x = v[k] * rs * (Prefetch ? weight[k] : w[c * N + d]);
+        const uint16_t h = act16(x);
+        xn16[xo + d] = f16img ? bf_to_hf_conv(h) : h;
+        if (xn16_lo) xn16_lo[xo + d] = bf_lo(x, h);
+    }
+}
+#endif
+
 // S23 (opt-in STRATA_CVEC_FUSE=1): a steered layer's FFN write, its control vector and the next half's norm in one
 // pass over R (was gr_write + cvec_apply + gr_norm_rs: three).  The write is gr_write_kernel's, the vector
 // cvec_kernel's (the same per-thread dot order over d = tid + 256 k, the same two-level xor reduction), the norm
@@ -1761,6 +1808,8 @@ __global__ void __launch_bounds__(32 * GW_VPK) gdn_wmma_prep_kernel(const float*
     }
 }
 
+#include "gdn_shared_qk_hip.cuh"
+
 // A thread's slice of a chunk in the scan (token threadIdx / 16, columns (threadIdx % 16) * 8 .. + 7): k, q and v,
 // loaded a chunk ahead, and one word of the chunk's T and P; lanes 0..15 of wave 0 also gate and beta of token l.
 // Rows past the end read the last row (finite: their gate and beta become 0 at staging, which keeps them out of the
@@ -1950,6 +1999,13 @@ bool gdn_rec_wmma(float* state, const float* h, const float* gate, const float* 
     if (!gfx11) return false;
     const int64_t nch = (T + GW_CK - 1) / GW_CK;
     _Float16* tp = reinterpret_cast<_Float16*>(y);
+    static const bool shared_qk = [] {
+        const char* value = std::getenv("STRATA_GDN_SHARED_QK");
+        return value && value[0] == '1';
+    }();
+    if (shared_qk && T > 64)
+        gdn_wmma_prep_shared_one_kernel<<<dim3(HK, (unsigned) nch), 32 * GW_VPK, 0, s>>>(h, gate, beta, tp, T);
+    else
     gdn_wmma_prep_kernel<<<dim3(HK, (unsigned) nch), 32 * GW_VPK, 0, s>>>(h, gate, beta, tp, T);
     gdn_wmma_scan_kernel<<<HV, GW_NW * 32, 0, s>>>(state, h, gate, beta, z, gamma, reinterpret_cast<const unsigned*>(tp),
                                                    eps, y16, T, ld16);
@@ -2090,6 +2146,7 @@ __global__ void moe_combine_kernel(const float* __restrict__ Dm, const int32_t* 
 
 // W (X5): four columns per thread, one float4 load per slot; the per-element expression and the k order are unchanged
 // (bitwise equal to moe_combine_kernel). Needs 16-byte aligned Dm / shared / bo (N * 4 bytes per row is a multiple of 16).
+template<bool HALF = false>
 __global__ void moe_combine4_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
                                     const float* __restrict__ w, const float4* __restrict__ shared,
                                     const float* __restrict__ sg, float4* __restrict__ bo, int64_t T,
@@ -2104,7 +2161,14 @@ __global__ void moe_combine4_kernel(const float* __restrict__ Dm, const int32_t*
     for (int k = 0; k < 10; ++k) {
         ww[k] = w[t * 10 + k];
         const int64_t r = slot[t * 10 + k];
-        v[k] = *reinterpret_cast<const float4*>(Dm + r * N + d);
+        if constexpr (HALF) {
+            const auto* row = reinterpret_cast<const __half*>(Dm) + r * N + d;
+            const float2 lo = __half22float2(*reinterpret_cast<const __half2*>(row));
+            const float2 hi = __half22float2(*reinterpret_cast<const __half2*>(row + 2));
+            v[k] = make_float4(lo.x, lo.y, hi.x, hi.y);
+        } else {
+            v[k] = *reinterpret_cast<const float4*>(Dm + r * N + d);
+        }
         if (row_sd) {   // NVFP4 in MMQ: the row's s_down, as moe_combine_kernel applies it
             const float sd = row_sd[r];
             v[k] = make_float4(v[k].x * sd, v[k].y * sd, v[k].z * sd, v[k].w * sd);
@@ -2119,6 +2183,76 @@ __global__ void moe_combine4_kernel(const float* __restrict__ Dm, const int32_t*
     const float4 sh = shared[i];
     bo[i] = make_float4(s.x + sh.x * g, s.y + sh.y * g, s.z + sh.z * g, s.w + sh.w * g);
 }
+
+#ifdef STRATA_USE_HIP
+// Keep bo in LDS; each HC stream retains the writer's original reduction.
+__global__ void __launch_bounds__(256) moe_combine_half_write_norm_kernel(
+    const uint16_t* __restrict__ Dm, const int32_t* __restrict__ slot,
+    const float* __restrict__ weights, const float4* __restrict__ shared,
+    const float* __restrict__ sg, float* __restrict__ R,
+    const float* __restrict__ inj, int64_t inj_ld, const float* __restrict__ norm,
+    float eps, float* __restrict__ rs_out, uint16_t* __restrict__ xn16,
+    uint16_t* __restrict__ xn16_lo, int64_t ldx, int f16img) {
+    __shared__ float4 combined[N / 4];
+    __shared__ float reduction[32];
+    const int64_t t = blockIdx.x;
+    for (int column = threadIdx.x; column < N / 4; column += 256) {
+        const int d = column * 4;
+        float4 values[10];
+        float ww[10];
+#pragma unroll
+        for (int k = 0; k < 10; ++k) {
+            ww[k] = weights[t * 10 + k];
+            const int64_t row_id = slot[t * 10 + k];
+            const __half* row = reinterpret_cast<const __half*>(Dm) + row_id * N + d;
+            const float2 lo = __half22float2(*reinterpret_cast<const __half2*>(row));
+            const float2 hi = __half22float2(*reinterpret_cast<const __half2*>(row + 2));
+            values[k] = make_float4(lo.x, lo.y, hi.x, hi.y);
+        }
+        float4 sum = make_float4(0, 0, 0, 0);
+#pragma unroll
+        for (int k = 0; k < 10; ++k) {
+            sum.x = fmaf(ww[k], values[k].x, sum.x);
+            sum.y = fmaf(ww[k], values[k].y, sum.y);
+            sum.z = fmaf(ww[k], values[k].z, sum.z);
+            sum.w = fmaf(ww[k], values[k].w, sum.w);
+        }
+        const float g = sigm(sg[t]);
+        const float4 sh = shared[t * (N / 4) + column];
+        combined[column] = make_float4(sum.x + sh.x * g, sum.y + sh.y * g,
+                                       sum.z + sh.z * g, sum.w + sh.w * g);
+    }
+    __syncthreads();
+    const float* bo = reinterpret_cast<const float*>(combined);
+#pragma unroll 1
+    for (int c = 0; c < HC; ++c) {
+        const int64_t row_id = t * HC + c;
+        float* row = R + row_id * N;
+        const float scale = 2.0f * sigm(inj[t * inj_ld + c] / (float) HC);
+        float values[GRW_PER];
+        float sum = 0;
+        int k = 0;
+#pragma unroll
+        for (int d = threadIdx.x; d < N; d += 256, ++k) {
+            const float value = fmaf(bo[d], scale, row[d]);
+            row[d] = value;
+            values[k] = value;
+            sum += value * value;
+        }
+        const float rs = rsqrtf(block_sum(sum, reduction) / (float) N + eps);
+        if (threadIdx.x == 0) rs_out[row_id] = rs;
+        k = 0;
+#pragma unroll
+        for (int d = threadIdx.x; d < N; d += 256, ++k) {
+            const float value = values[k] * rs * norm[c * N + d];
+            const uint16_t h = act16(value);
+            const int64_t output = t * ldx + (int64_t) c * N + d;
+            xn16[output] = f16img ? bf_to_hf_conv(h) : h;
+            if (xn16_lo) xn16_lo[output] = bf_lo(value, h);
+        }
+    }
+}
+#endif
 
 // ---------------------------------------------------------------- QSA helpers
 __global__ void rms_rows_kernel(float* __restrict__ x, const float* __restrict__ w, int64_t cols, int64_t ld, float eps) {
@@ -2154,6 +2288,27 @@ __global__ void rope_kernel(float* __restrict__ x, int64_t heads, int64_t dim, i
     p[pair] = a * c - b * s;
     p[pair + 32] = a * s + b * c;
 }
+__global__ void split_q_norm_kernel(const float* __restrict__ qf, const float* __restrict__ w,
+                                   float* __restrict__ q, float eps) {
+    __shared__ float sh[32];
+    const int64_t row = blockIdx.x;
+    const int col = threadIdx.x;
+    const float value = qf[row * 512 + col];
+    float ss = 0.0f;
+    ss += value * value;
+    // The original runtime row loop rounds the square before the shuffle sum.
+#if defined(__HIPCC__)
+    asm volatile("" : "+v"(ss));
+#else
+    asm volatile("" : "+f"(ss));
+#endif
+    const float s = rsqrtf(block_sum(ss, sh) / 256.0f + eps);
+    __syncthreads();
+    q[row * 256 + col] = s * value * w[col];
+}
+#if defined(__HIPCC__)
+#include "qnorm_rope_hip.cuh"
+#endif
 __global__ void split_q_kernel(const float* __restrict__ qf, float* __restrict__ q, int64_t T) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * 24 * 256) return;
@@ -2304,6 +2459,9 @@ __global__ void __launch_bounds__(256) gr_upmix_kernel(const uint16_t* __restric
         if (mixed_h) mixed_h[t * N + d] = hf(s);
     }
 }
+#include "hc_wide_hip.cuh"
+#include "hc_wide_reg_hip.cuh"
+
 #endif
 #if !defined(__HIPCC__)
 // S23 on CUDA (sm_80+; opt-in STRATA_HC_UPMIX=1, see hc_upmix in prefill.cpp): the hyper-connection read's up
@@ -2522,6 +2680,10 @@ void gr_mix_r(const float* R, const float* rs, const float* w_norm, const float*
 }
 bool gr_upmix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const float* rs, const float* w_norm,
               float* mixed, uint16_t* mixed16, uint16_t* mixed_h, int64_t T, void* stream) {
+    return gr_upmix(lo16, w_up, R, rs, w_norm, mixed, mixed16, mixed_h, T, stream, 0);
+}
+bool gr_upmix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const float* rs, const float* w_norm,
+              float* mixed, uint16_t* mixed16, uint16_t* mixed_h, int64_t T, void* stream, int64_t mixed_h_ld) {
 #if defined(__HIPCC__)
     static const bool gfx11 = [] {
         int dev = 0;
@@ -2530,11 +2692,35 @@ bool gr_upmix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const 
         return strata::kernels::gfx_arch_is_gfx11_wmma(p.gcnArchName);
     }();
     if (!gfx11 || T <= 0) return false;
+    static const bool wide = [] { const char* e=std::getenv("STRATA_HC_UPMIX_WIDE"); return e && e[0]=='1'; }();
+    if (wide) {
+        static const int shape = [] { const char* e=std::getenv("STRATA_HC_UPMIX_SHAPE"); return e ? std::atoi(e) : 256; }();
+        if (shape == 128)
+            hc_wide::upmix<128,128,1,4,2,8><<<dim3((T+127)/128,80),256,0,(cudaStream_t)stream>>>(
+                w_up, reinterpret_cast<const __half*>(lo16), mixed, R, rs, w_norm, mixed16, mixed_h, T, D, LR, 0, mixed_h_ld);
+        else if (shape == 512)
+            {
+                static const bool reg=[] { const char* e=std::getenv("STRATA_HC_REG_STAGE"); return e && e[0]=='1'; }();
+                if(reg)
+                    hc_wide_reg::upmix<512,64,1,8,1,4><<<dim3((T+63)/64,20),256,0,(cudaStream_t)stream>>>(
+                        w_up,reinterpret_cast<const __half*>(lo16),mixed,R,rs,w_norm,mixed16,mixed_h,T,D,LR,0,mixed_h_ld);
+                else
+            hc_wide::upmix<512,64,1,8,1,4><<<dim3((T+63)/64,20),256,0,(cudaStream_t)stream>>>(
+                w_up, reinterpret_cast<const __half*>(lo16), mixed, R, rs, w_norm, mixed16, mixed_h, T, D, LR, 0, mixed_h_ld);
+            }
+        else
+            hc_wide::upmix<256,128,1,4,2,8><<<dim3((T+127)/128,40),256,0,(cudaStream_t)stream>>>(
+                w_up, reinterpret_cast<const __half*>(lo16), mixed, R, rs, w_norm, mixed16, mixed_h, T, D, LR, 0, mixed_h_ld);
+        check("gr_upmix_wide");
+        return true;
+    }
+    if (mixed_h_ld > 0 && mixed_h_ld != N) return false;
     gr_upmix_kernel<<<dim3(N / UM_D, (unsigned) ((T + UM_T - 1) / UM_T)), 256, 0, (cudaStream_t) stream>>>(
         lo16, w_up, R, rs, w_norm, mixed, mixed16, mixed_h, T);
     check("gr_upmix");
     return true;
 #else
+    if (mixed_h_ld > 0 && mixed_h_ld != N) return false;
     static int ok_dev[64] = {};   // per device: 0 not asked yet, 1 sm_80+, 2 no
     int dev = 0;
     if (T <= 0 || cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
@@ -2553,6 +2739,22 @@ bool gr_upmix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const 
 }
 void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* w_norm_next, float eps,
                       float* rs, uint16_t* xn16, int64_t T, void* stream, uint16_t* xn16_lo, int64_t ldx, bool f16img) {
+#if defined(__HIPCC__)
+    static const int mode = [] {
+        const char* e = std::getenv("STRATA_PF_HC_NORM");
+        return e ? std::atoi(e) : 0;
+    }();
+    if (mode == 1 || mode == 2) {
+        if (mode == 1)
+            gr_write_norm_fixed_kernel<false><<<(unsigned) (T * HC), 256, 0, (cudaStream_t) stream>>>(
+                R, bo, inj, inj_ld, w_norm_next, eps, rs, xn16, xn16_lo, ldx > 0 ? ldx : D, f16img ? 1 : 0);
+        else
+            gr_write_norm_fixed_kernel<true><<<(unsigned) (T * HC), 256, 0, (cudaStream_t) stream>>>(
+                R, bo, inj, inj_ld, w_norm_next, eps, rs, xn16, xn16_lo, ldx > 0 ? ldx : D, f16img ? 1 : 0);
+        check("gr_write_norm_rs_fixed");
+        return;
+    }
+#endif
     gr_write_norm_rs_kernel<<<(unsigned) (T * HC), 256, 0, (cudaStream_t) stream>>>(R, bo, inj, inj_ld, w_norm_next, eps,
                                                                                       rs, xn16, xn16_lo,
                                                                                       ldx > 0 ? ldx : D, f16img ? 1 : 0);
@@ -2900,7 +3102,7 @@ void moe_combine(const float* Dm, const int32_t* slot, const float* w, const flo
                  int64_t T, void* stream, const float* row_sd) {
 #ifndef STRATA_W_NO_COMB
     if (((reinterpret_cast<uintptr_t>(Dm) | reinterpret_cast<uintptr_t>(shared) | reinterpret_cast<uintptr_t>(bo)) & 15) == 0) {
-        moe_combine4_kernel<<<blocks_for(T * (N / 4)), 256, 0, (cudaStream_t) stream>>>(
+        moe_combine4_kernel<false><<<blocks_for(T * (N / 4)), 256, 0, (cudaStream_t) stream>>>(
             Dm, slot, w, reinterpret_cast<const float4*>(shared), sg, reinterpret_cast<float4*>(bo), T, row_sd);
         check("moe_combine");
         return;
@@ -2909,6 +3111,28 @@ void moe_combine(const float* Dm, const int32_t* slot, const float* w, const flo
     moe_combine_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg, bo, T, row_sd);
     check("moe_combine");
 }
+#ifdef STRATA_USE_HIP
+void moe_combine_half(const uint16_t* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg,
+                      float* bo, int64_t T, void* stream) {
+    if (T <= 0) return;
+    moe_combine4_kernel<true><<<blocks_for(T * (N / 4)), 256, 0, (cudaStream_t) stream>>>(
+        reinterpret_cast<const float*>(Dm), slot, w, reinterpret_cast<const float4*>(shared), sg,
+        reinterpret_cast<float4*>(bo), T, nullptr);
+    check("moe_combine_half");
+}
+void moe_combine_half_write_norm(const uint16_t* Dm, const int32_t* slot, const float* w,
+                                 const float* shared, const float* sg, float* R, const float* inj,
+                                 int64_t inj_ld, const float* norm, float eps, float* rs,
+                                 uint16_t* xn16, int64_t T, void* stream,
+                                 uint16_t* xn16_lo, int64_t ldx, bool f16img) {
+    if (T <= 0) return;
+    moe_combine_half_write_norm_kernel<<<(unsigned) T, 256, 0, (cudaStream_t) stream>>>(
+        Dm, slot, w, reinterpret_cast<const float4*>(shared), sg, R, inj, inj_ld,
+        norm, eps, rs, xn16, xn16_lo, ldx > 0 ? ldx : D, f16img ? 1 : 0);
+    check("moe_combine_half_write_norm");
+}
+#endif
+
 void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, float eps, void* stream) {
     if (rows <= 0) return;
     rms_rows_kernel<<<(unsigned) rows, 256, 0, (cudaStream_t) stream>>>(x, w, cols, ld, eps);
@@ -2934,6 +3158,46 @@ void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t p
             x, heads, dim, ld, pos0, theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor, k.attn_factor,
             strata::kernels::mrope_table(), rt);
     check("rope");
+}
+#if defined(__HIPCC__)
+bool split_q_norm_rope(const float* qf, const float* w, float* q, int64_t T, float eps,
+                       int64_t pos0, const strata::kernels::RopeScaling& scaling, void* stream) {
+    static const bool enabled = [] {
+        const char* e = std::getenv("STRATA_PF_QNORM_ROPE");
+        return e && std::strcmp(e, "1") == 0;
+    }();
+    if (!enabled || T < 4096) return false;
+    if (strata::kernels::rope_scaling_invalid(scaling)) return false;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return false;
+    static thread_local int cached_dev = -1;
+    static thread_local bool gfx1151 = false;
+    if (cached_dev != dev) {
+        cudaDeviceProp prop;
+        if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) return false;
+        gfx1151 = strata::kernels::gfx_arch_is_gfx1151(prop.gcnArchName);
+        cached_dev = dev;
+    }
+    if (!gfx1151) return false;
+    const float theta_scale = powf((float) scaling.freq_base, -2.0f / 64.0f);
+    const strata::kernels::RopeKernelArgs k = scaling.kernel_args(64);
+    const strata::kernels::RopeTab rt = strata::kernels::rope_table_for(scaling);
+    if (rt.cos != nullptr)
+        split_q_norm_rope_kernel<true><<<(unsigned) (T * 24), 256, 0, (cudaStream_t) stream>>>(
+            qf, w, q, eps, pos0, theta_scale, k.freq_scale, k.corr_low, k.corr_high,
+            k.ext_factor, k.attn_factor, strata::kernels::mrope_table(), rt);
+    else
+        split_q_norm_rope_kernel<false><<<(unsigned) (T * 24), 256, 0, (cudaStream_t) stream>>>(
+            qf, w, q, eps, pos0, theta_scale, k.freq_scale, k.corr_low, k.corr_high,
+            k.ext_factor, k.attn_factor, strata::kernels::mrope_table(), rt);
+    check("split_q_norm_rope");
+    return true;
+}
+#endif
+void split_q_norm(const float* q_full, const float* w, float* q, int64_t T, float eps, void* stream) {
+    if (T <= 0) return;
+    split_q_norm_kernel<<<(unsigned) (T * 24), 256, 0, (cudaStream_t) stream>>>(q_full, w, q, eps);
+    check("split_q_norm");
 }
 void split_q(const float* q_full, float* q, int64_t T, void* stream) {
     split_q_kernel<<<blocks_for(T * 24 * 256), 256, 0, (cudaStream_t) stream>>>(q_full, q, T);

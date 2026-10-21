@@ -234,17 +234,26 @@ void run_mmq(const Pair& p, const Geo& geo, mmq::Context& ctx, MmqBufs& b, const
 
 // the fused path: quantize, group on the device, then launches over expert ranges `cuts` (e.g. {0, 20, 64})
 struct FusedBufs {
-    Dev xa, ha, dm, scratch, slot, src, ids;
+    int input_stride = std::getenv("STRATA_TEST_MIXED_PAD") ? N + 64 : N;
+    Dev xa, ha, dm, scratch, slot, src, ids, x_half;
     FusedBufs(int T, int64_t rows, int E)
-        : xa(fused::act_bytes(T, N)), ha(fused::act_bytes(rows, FF)), dm((size_t) rows * N * 4),
+        : xa(fused::act_bytes(T, N)), ha(std::max(fused::act_bytes(rows, FF), (size_t) rows * FF * 2)), dm((size_t) rows * N * 4),
           scratch(fused::group_bytes(rows, E)), slot((size_t) rows * 4), src((size_t) rows * 4),
-          ids((size_t) rows * 4) {}
+          ids((size_t) rows * 4), x_half((size_t) T * input_stride * 2) {}
 };
+void prepare_fused_input(const Pair& p, FusedBufs& b, const std::vector<float>& x, cudaStream_t s) {
+    if (!fused::native_f16_supported(p.gu, p.d)) return;
+    std::vector<ggml_fp16_t> half(x.size() / N * b.input_stride);
+    for (size_t i = 0; i < x.size(); ++i) half[i / N * b.input_stride + i % N] = ggml_fp32_to_fp16(x[i]);
+    ck(cudaMemcpyAsync(b.x_half.p, half.data(), half.size() * 2, cudaMemcpyHostToDevice, s), "half inputs");
+    ck(cudaStreamSynchronize(s), "half inputs ready");
+}
 void run_fused(const Pair& p, const Geo& geo, FusedBufs& b, const float* x_dev, int T, int E,
                const std::vector<int>& cuts, const std::vector<const uint8_t*>& blob, cudaStream_t s) {
     const int64_t rows = (int64_t) T * K;
     const fused::NativeGeom ng = geo.native(p);
-    fused::quantize_act_native(x_dev, T, N, b.xa.p, s);
+    const bool f16 = fused::native_f16_supported(p.gu, p.d);
+    if (!f16) fused::quantize_act_native(x_dev, T, N, b.xa.p, s);
     fused::group(b.ids.as<int32_t>(), rows, K, E, b.scratch.p, b.slot.as<int32_t>(), b.src.as<int32_t>(), s);
     for (size_t c = 0; c + 1 < cuts.size(); ++c) {
         for (int e0 = cuts[c]; e0 < cuts[c + 1]; e0 += fused::kMaxBatch) {
@@ -252,7 +261,11 @@ void run_fused(const Pair& p, const Geo& geo, FusedBufs& b, const float* x_dev, 
             bt.e0 = e0;
             bt.e1 = std::min(cuts[c + 1], e0 + fused::kMaxBatch);
             for (int e = bt.e0; e < bt.e1; ++e) bt.blob[e - bt.e0] = blob[(size_t) e];
-            fused::experts_native(bt, ng, E, rows, b.scratch.p, b.xa.p, b.src.as<int32_t>(), b.ha.p, b.dm.as<float>(), s);
+            if (f16)
+                fused::experts_native_f16(bt, ng, E, b.scratch.p, b.x_half.as<uint16_t>(), b.src.as<int32_t>(),
+                                          b.ha.p, b.dm.as<float>(), s, fused::native_f16_half_down(), b.input_stride);
+            else
+                fused::experts_native(bt, ng, E, rows, b.scratch.p, b.xa.p, b.src.as<int32_t>(), b.ha.p, b.dm.as<float>(), s);
         }
     }
 }
@@ -299,6 +312,14 @@ std::vector<float> download(const Dev& d, size_t n) {
     ck(cudaMemcpy(h.data(), d.p, n * 4, cudaMemcpyDeviceToHost), "download");
     return h;
 }
+std::vector<float> download_fused(const Dev& d, size_t n, const Pair& p) {
+    if (!fused::native_f16_supported(p.gu, p.d) || !fused::native_f16_half_down()) return download(d, n);
+    std::vector<ggml_fp16_t> half(n);
+    ck(cudaMemcpy(half.data(), d.p, n * 2, cudaMemcpyDeviceToHost), "download half down");
+    std::vector<float> out(n);
+    for (size_t i = 0; i < n; ++i) out[i] = ggml_fp16_to_fp32(half[i]);
+    return out;
+}
 std::vector<int32_t> download_i(const Dev& d, size_t n) {
     std::vector<int32_t> h(n);
     ck(cudaMemcpy(h.data(), d.p, n * 4, cudaMemcpyDeviceToHost), "download");
@@ -338,13 +359,14 @@ void reference_part(const Pair& p, cudaStream_t s) {
     MmqBufs* mbp = mq ? new MmqBufs(p, rows, E) : nullptr;
     if (mq) run_mmq(p, geo, ctx, *mbp, r, x_dev.as<float>(), src_dev.as<int32_t>(), blob, rows, s);
     FusedBufs fb(T, rows, E);
+    prepare_fused_input(p, fb, x, s);
     ck(cudaMemcpy(fb.ids.p, ids.data(), ids.size() * 4, cudaMemcpyHostToDevice), "ids");
     ck(cudaMemset(fb.dm.p, 0xff, (size_t) rows * N * 4), "sentinel");   // an unwritten row is NaN
     ck(cudaDeviceSynchronize(), "uploads");
     run_fused(p, geo, fb, x_dev.as<float>(), T, E, {0, 1, 20, E}, blob, s);
     ck(cudaStreamSynchronize(s), "sync");
     const std::vector<float> y_mmq = mq ? download(mbp->dm, (size_t) rows * N) : std::vector<float>((size_t) rows * N, 0.0f),
-                             y_f = download(fb.dm, (size_t) rows * N);
+                             y_f = download_fused(fb.dm, (size_t) rows * N, p);
     delete mbp;
     const std::vector<int32_t> slot = download_i(fb.slot, (size_t) rows), fsrc = download_i(fb.src, (size_t) rows);
     for (int64_t i = 0; i < rows; ++i)
@@ -399,6 +421,16 @@ void reference_part(const Pair& p, cudaStream_t s) {
     auto frow = [&](size_t i) { return (int64_t) slot[i]; };
     const Err em = mq ? compare(y_mmq, mrow, ref, pair, (size_t) rows) : Err{};
     const Err ef = compare(y_f, frow, ref, pair, (size_t) rows);
+    if (fused::native_f16_supported(p.gu, p.d)) {
+        std::printf("  FP16 fused vs independent FP64 sums: rel RMS %.3e worst %.3e\n", ef.rms, ef.worst);
+        if (ef.rms > 2e-3 || ef.worst > 3e-2)
+            throw std::runtime_error(std::string(p.name) + ": FP16 experts differ from the reference");
+        for (int k = 0; k < K; ++k)
+            for (int o = 0; o < N; ++o)
+                if (y_f[(size_t) slot[(size_t) (ZERO * K + k)] * N + o] != 0.0f)
+                    throw std::runtime_error("FP16 experts changed a zero row");
+        return;
+    }
     const Err efm = mq ? compare(y_f, frow, y_mmq, mrow, (size_t) rows) : Err{};
     const Err e2 = compare(y_f, frow, ref2, pair, (size_t) rows);
     std::printf("  fused vs the int8-rounded model (same activation / H rounding, double sums): rel RMS %.3e  worst %.3e\n",
@@ -458,6 +490,7 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
     MmqBufs* mbp = mq ? new MmqBufs(p, rows, E) : nullptr;
     MmqBufs& mb = *mbp;   // (only used when mq)
     FusedBufs fb(T, rows, E);
+    prepare_fused_input(p, fb, x, s);
     ck(cudaMemcpy(fb.ids.p, ids.data(), ids.size() * 4, cudaMemcpyHostToDevice), "ids");
     ck(cudaDeviceSynchronize(), "uploads");   // (see reference_part)
     cudaEvent_t a, b;
@@ -522,7 +555,7 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
     std::printf("  (fused back to back: median %.3f ms, min %.3f; alternating min %.3f; MMQ min %.3f)\n", tf2[4],
                 tf2[0], tf[0], tm[0]);
     const std::vector<float> y_mmq = mq ? download(mb.dm, (size_t) rows * N) : std::vector<float>((size_t) rows * N, 0.0f),
-                             y_f = download(fb.dm, (size_t) rows * N);
+                             y_f = download_fused(fb.dm, (size_t) rows * N, p);
     const std::vector<int32_t> slot = download_i(fb.slot, (size_t) rows);
     {   // (Aurora S23) a hash of the fused output's bits, to compare two builds bit for bit
         uint64_t hsh = 1469598103934665603ull;

@@ -696,12 +696,17 @@ __global__ void __launch_bounds__(256, 1) block_scores_simt2_kernel(const float*
 // ---- the same top-k with each query's keys read once: 1,024 threads hold up to TK_PER consecutive blocks' keys in
 // registers (contexts up to 4 * 1024 * TK_PER cells), per-warp histograms, block-wide scans. The selection rule is
 // block_topk_kernel's (radix threshold, ties to the lowest index, cells ascending): identical ids.
+#if defined(__HIPCC__)
+// gfx1151 cannot fit the register kernel's 151+ VGPRs at 1,024 threads.
+// Keep fewer waves together; the integer radix and stable emit rules are unchanged.
+constexpr int TK_T = 512;
+#else
 constexpr int TK_T = 1024;
+#endif
 constexpr int TK_PER = 33;
 #if defined(__HIPCC__)
-// AMD (RDNA, wave32): a 1,024-thread block may use 192 VGPRs per lane, so the keys of 66 blocks per thread fit - contexts
-// up to 4 * 1024 * 66 = 270,336 cells (the 262,144 --max-context) keep the register kernel. NVIDIA's 64 registers per
-// thread at 1,024 threads allow only TK_PER.
+// At 512 threads the 66-key variant fits gfx1151's register budget. Contexts above
+// 4 * 512 * 66 cells use the streaming kernel. NVIDIA keeps 33 keys at 1,024 threads.
 constexpr int TK_PER_MAX = 66;
 #else
 constexpr int TK_PER_MAX = TK_PER;
@@ -718,7 +723,7 @@ __device__ __forceinline__ int block_excl_scan(int v, int* s_warp, int& total) {
     if (lane == 31) s_warp[warp] = x;
     __syncthreads();
     if (warp == 0) {
-        int w = s_warp[lane];
+        int w = lane < TK_T / 32 ? s_warp[lane] : 0;
         int z = w;
 #pragma unroll
         for (int o = 1; o < 32; o <<= 1) {

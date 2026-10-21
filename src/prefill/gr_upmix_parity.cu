@@ -82,10 +82,11 @@ struct Inputs {
 struct Outputs {
     float* mixed;
     uint16_t *bf, *h;
-    explicit Outputs(int64_t T) {
+    explicit Outputs(int64_t T, int64_t half_stride = N) {
         mixed = dalloc<float>((size_t) T * N);
         bf = dalloc<uint16_t>((size_t) T * N);
-        h = dalloc<uint16_t>((size_t) T * N);
+        h = dalloc<uint16_t>((size_t) T * half_stride);
+        cudaMemset(h, 0xa5, (size_t) T * half_stride * 2);
     }
     ~Outputs() { cudaFree(mixed); cudaFree(bf); cudaFree(h); }
 };
@@ -106,10 +107,11 @@ double exact_mixed(const Inputs& in, int64_t t, int d) {
 
 int check(strata::prefill::Gemm& gm, cudaStream_t st, float* gated, int64_t T, uint32_t seed) {
     Inputs in(T, seed);
-    Outputs ref(T), got(T);
+    const int64_t half_stride = std::getenv("STRATA_TEST_MIXED_PAD") ? N + 64 : N;
+    Outputs ref(T), got(T, half_stride);
     gm.bf16(in.d_lo16, in.d_wu, gated, T, D, LR);
     strata::prefill::gr_mix_r(in.d_R, in.d_rs, in.d_w, gated, ref.mixed, ref.bf, T, st, ref.h);
-    if (!strata::prefill::gr_upmix(in.d_lo16, in.d_wu, in.d_R, in.d_rs, in.d_w, got.mixed, got.bf, got.h, T, st)) {
+    if (!strata::prefill::gr_upmix(in.d_lo16, in.d_wu, in.d_R, in.d_rs, in.d_w, got.mixed, got.bf, got.h, T, st, half_stride)) {
         std::printf("FAIL T=%lld: gr_upmix refused (needs CUDA sm_80+)\n", (long long) T);
         return 1;
     }
@@ -122,7 +124,27 @@ int check(strata::prefill::Gemm& gm, cudaStream_t st, float* gated, int64_t T, u
     cudaMemcpy(abf.data(), ref.bf, n * 2, cudaMemcpyDeviceToHost);
     cudaMemcpy(bbf.data(), got.bf, n * 2, cudaMemcpyDeviceToHost);
     cudaMemcpy(ah.data(), ref.h, n * 2, cudaMemcpyDeviceToHost);
-    cudaMemcpy(bh.data(), got.h, n * 2, cudaMemcpyDeviceToHost);
+    std::vector<uint16_t> padded((size_t) T * half_stride);
+    cudaMemcpy(padded.data(), got.h, padded.size() * 2, cudaMemcpyDeviceToHost);
+    for (int64_t t = 0; t < T; ++t) {
+        std::copy_n(padded.data() + t * half_stride, N, bh.data() + t * N);
+        for (int64_t d = N; d < half_stride; ++d)
+            if (padded[t * half_stride + d] != 0xa5a5) { std::printf("FAIL: padded FP16 guard\n"); return 1; }
+    }
+    if (std::getenv("STRATA_TEST_MIXED_F32_SKIP")) {
+        cudaMemset(got.bf, 0xa5, n * 2);
+        cudaMemset(got.h, 0xa5, padded.size() * 2);
+        if (!strata::prefill::gr_upmix(in.d_lo16, in.d_wu, in.d_R, in.d_rs, in.d_w,
+                                     nullptr, got.bf, got.h, T, st, half_stride)) return 1;
+        if (!ck(cudaStreamSynchronize(st), "run without FP32 image")) return 1;
+        std::vector<uint16_t> skip_bf(n), skip_h(padded.size());
+        cudaMemcpy(skip_bf.data(), got.bf, n * 2, cudaMemcpyDeviceToHost);
+        cudaMemcpy(skip_h.data(), got.h, skip_h.size() * 2, cudaMemcpyDeviceToHost);
+        if (skip_bf != bbf || skip_h != padded) {
+            std::printf("FAIL: omitting the FP32 image changed the BF16/FP16 images\n");
+            return 1;
+        }
+    }
     double md = 0, mv = 0;
     size_t bf_diff = 0, h_diff = 0, bit_diff = 0, nonfinite = 0;
     for (size_t i = 0; i < n; ++i) {

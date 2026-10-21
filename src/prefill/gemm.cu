@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -57,6 +58,7 @@
 #if defined(__HIPCC__)
 #include <hip/hip_fp16.h>
 #endif
+
 
 namespace strata::prefill {
 namespace {
@@ -1225,6 +1227,62 @@ void Gemm::f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T
     }
 #else
     (void) X; (void) W; (void) Y; (void) T; (void) N; (void) K; (void) ldy;
+#endif
+}
+
+int Gemm::native_shared_up(const uint16_t* X, int type, const void* W, const float* gate,
+                            uint16_t* H, int64_t T, int64_t N, int64_t K, int64_t ldx) {
+#ifdef STRATA_USE_HIP
+    static const bool on = [] { const char* v=std::getenv("STRATA_PF_SHARED_UP"); return v && v[0]=='1'; }();
+    if (!on) return 0;
+    static const bool selected = [] {
+        auto one=[](const char* key){const char* v=std::getenv(key);return v && v[0]=='1';};
+        return one("STRATA_PF_PAD") && one("STRATA_PF_GEMM") && !std::getenv("STRATA_F16_RANGE");
+    }();
+    static const int64_t min_t=[] {const char* v=std::getenv("STRATA_PF_SWITCH_MIN_T");return v?std::atoll(v):0LL;}();
+    if (!selected || T < std::max<int64_t>(4096,min_t) || !X || !W || !gate || !H ||
+        N != 640 || K != 2560 || N*(K+64)>scratch_elems_) return 0;
+    if (ldx<=0) ldx=K;
+    if ((reinterpret_cast<uintptr_t>(X)&15) || (reinterpret_cast<uintptr_t>(scratch_)&15) ||
+        (reinterpret_cast<uintptr_t>(gate)&3) || (reinterpret_cast<uintptr_t>(H)&1)) return 0;
+    if (hipPeekAtLastError()!=hipSuccess) return -1;
+    if (!strata_pf_shared_up_f16_supported(T,N,K,ldx,K+64))
+        return hipPeekAtLastError()==hipSuccess ? 0 : -1;
+    // Unsupported types return before dequant launches. The existing dequant launcher remains process-fatal on error.
+    if (!strata::kernels::dequant_f16_ld(type,W,0,N,K,K+64,scratch_,stream_)) return 0;
+    if (hipPeekAtLastError()!=hipSuccess) return -1;
+    const int status=strata_pf_shared_up_f16(X,ldx,scratch_,K+64,gate,H,T,N,K,stream_);
+    return status==1 ? 1 : -1; // Dequant is already queued: never fall back here.
+#else
+    (void)X;(void)type;(void)W;(void)gate;(void)H;(void)T;(void)N;(void)K;(void)ldx;
+    return 0;
+#endif
+}
+
+int Gemm::native_ssm(const uint16_t* X, int ggml_type, const void* W_blocks, float* qkv,
+                      const float* conv_w, float* history, float* h, int64_t T, int64_t N,
+                      int64_t K, float eps, int64_t ldx) {
+#ifdef STRATA_USE_HIP
+    static const bool on = [] { const char* v = std::getenv("STRATA_PF_DENSE_SSM_CONV"); return v && (v[0] == '1' || v[0] == '2'); }();
+    if (!on) return 0;
+    static const bool selected = [] {
+        auto one = [](const char* k) { const char* v = std::getenv(k); return v && v[0] == '1'; };
+        const char* bk = std::getenv("STRATA_PF_BK64");
+        return one("STRATA_PF_PAD") && one("STRATA_PF_GEMM") && one("STRATA_PF_DENSE_EP") && (!bk || bk[0] != '0');
+    }();
+    static const int64_t min_t = [] { const char* v = std::getenv("STRATA_PF_SWITCH_MIN_T"); return v ? (int64_t) std::atoll(v) : 0; }();
+    if (!selected || T <= 64 || T < min_t || N != 10240 || K != 2560 || !W_blocks ||
+        N * (K + 64) > scratch_elems_) return 0;
+    if (ldx <= 0) ldx = K;
+    if (ldx < K || ldx % 8 || ldx > (1LL << 30)) return 0;
+    // The same padded native dequantization as native(); scratch remains live through the projection on this stream.
+    if (!strata::kernels::dequant_f16_ld(ggml_type, W_blocks, 0, N, K, K + 64, scratch_, stream_)) return 0;
+    if (cudaGetLastError() != cudaSuccess) return -1;
+    return strata_pf_dense_ssm_conv(X, ldx, scratch_, K + 64, qkv, conv_w, history, h, T, N, K, eps, stream_);
+#else
+    (void) X; (void) ggml_type; (void) W_blocks; (void) qkv; (void) conv_w; (void) history;
+    (void) h; (void) T; (void) N; (void) K; (void) eps; (void) ldx;
+    return 0;
 #endif
 }
 

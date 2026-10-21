@@ -29,6 +29,8 @@ void gr_mix_r(const float* R, const float* rs, const float* w_norm, const float*
 /// epilogue - `gated` is never written.  gfx11 and CUDA sm_80+; false (nothing launched) elsewhere.
 bool gr_upmix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const float* rs, const float* w_norm,
               float* mixed, uint16_t* mixed16, uint16_t* mixed_h, int64_t T, void* stream);
+bool gr_upmix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const float* rs, const float* w_norm,
+              float* mixed, uint16_t* mixed16, uint16_t* mixed_h, int64_t T, void* stream, int64_t mixed_h_ld);
 void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* w_norm_next, float eps,
                       float* rs, uint16_t* xn16, int64_t T, void* stream, uint16_t* xn16_lo = nullptr,
                       int64_t ldx = 0, bool f16img = false);
@@ -98,6 +100,16 @@ void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int
 /// bo[t, :] = shared[t, :] * sigmoid(sg[t]) + sum_k w[t, k] * D[slot[t, k], :]
 void moe_combine(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream, const float* row_sd = nullptr);
+#ifdef STRATA_USE_HIP
+void moe_combine_half(const uint16_t* D, const int32_t* slot, const float* w, const float* shared, const float* sg,
+                      float* bo, int64_t T, void* stream);
+/// The same FP16-row combine and HC write/norm, with the combined FP32 row kept in LDS.
+void moe_combine_half_write_norm(const uint16_t* D, const int32_t* slot, const float* w,
+                                 const float* shared, const float* sg, float* R, const float* inj,
+                                 int64_t inj_ld, const float* norm, float eps, float* rs,
+                                 uint16_t* xn16, int64_t T, void* stream,
+                                 uint16_t* xn16_lo = nullptr, int64_t ldx = 0, bool f16img = false);
+#endif
 /// --peer-device's prompt share as sums: bo[t, :] = (sum over the k with slot[t, k] < rows_local of w[t, k] *
 /// D[slot[t, k], :], in k order) + peer[t, :] + shared[t, :] * sigmoid(sg[t]).  `peer` (the peer's per-token sums)
 /// may be mapped host memory.
@@ -129,6 +141,13 @@ void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t p
           const strata::kernels::RopeScaling& scaling, void* stream);
 /// q_full [T, 24, 512] (q | gate per head) -> q [T, 24, 256]
 void split_q(const float* q_full, float* q, int64_t T, void* stream);
+/// Split the query half of each 512-value head and normalize its 256 values.
+void split_q_norm(const float* q_full, const float* w, float* q, int64_t T, float eps, void* stream);
+#ifdef STRATA_USE_HIP
+/// Opt-in gfx1151 query split/norm+RoPE; false preserves the original separate launches.
+bool split_q_norm_rope(const float* q_full, const float* w, float* q, int64_t T, float eps,
+                       int64_t pos0, const strata::kernels::RopeScaling& scaling, void* stream);
+#endif
 /// attn[t, h, d] *= sigmoid(q_full[t, h, 256 + d]) -> out16 (fp16 bits: the o-projection is quantized)
 void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t T, void* stream, int64_t ld16 = 0);
 

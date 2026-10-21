@@ -124,6 +124,13 @@ Tables tables(void* scratch, int n_expert) {
             (int2*) ((uint8_t*) scratch + tiles_at(n_expert))};
 }
 
+
+#if defined(__HIPCC__)
+#include "moe_f16_hip.cuh"
+#include "moe_f16_gu192_hip.cuh"
+#include "moe_f16_down192_hip.cuh"
+#endif
+
 // ---- activations in natural order: one warp per 64 values
 __global__ void quant_act_nat_kernel(const float* __restrict__ x, int64_t nblk, uint8_t* __restrict__ xa) {
     const int64_t w = (int64_t) blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
@@ -1539,6 +1546,96 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
     if (g.d_type == T_Q2_0) launch<T_Q2_0, false>(ww, g_d, b, g, tb, ha, src, nullptr, dm, s);
     else launch<T_IQ4_NL, false>(ww, g_d, b, g, tb, ha, src, nullptr, dm, s);
     ck(cudaGetLastError(), "experts_native");
+}
+
+bool native_f16_supported(int gu_type, int d_type) {
+#if defined(__HIPCC__)
+    static const bool want = [] { const char* v = std::getenv("STRATA_PF_F16"); return v && v[0] == '1'; }();
+    static const bool input = [] { const char* v = std::getenv("STRATA_PF_F16_INPUT"); return v && v[0] == '1'; }();
+    return want && input && dev_info().ok && !dev_info().w12 &&
+           (gu_type == T_Q4_K || gu_type == T_Q5_K) && (d_type == T_Q5_1 || d_type == T_Q8_0);
+#else
+    (void) gu_type; (void) d_type;
+    return false;
+#endif
+}
+
+bool native_f16_half_down() {
+#if defined(__HIPCC__)
+    static const bool on = [] { const char* v = std::getenv("STRATA_PF_F16_HALF_DOWN"); return v && v[0] == '1'; }();
+    return on;
+#else
+    return false;
+#endif
+}
+
+void experts_native_f16(const Batch& b, const NativeGeom& g, int n_expert, const void* scratch,
+                        const uint16_t* x, const int32_t* src, void* h, float* dm, void* stream, bool half_down, int64_t input_stride, int64_t tokens) {
+#if defined(__HIPCC__)
+    const Tables tb = tables(const_cast<void*>(scratch), n_expert);
+    const cudaStream_t s = (cudaStream_t) stream;
+    const auto* input = reinterpret_cast<const __half*>(x);
+    auto* hidden = reinterpret_cast<__half*>(h);
+    float* down = half_down ? nullptr : dm;
+    auto* down_half = half_down ? reinterpret_cast<__half*>(dm) : nullptr;
+    // Scheduling only: each block walks independent routed tiles with the same arithmetic.
+    static const unsigned grid_y = [] {
+        const char* value = std::getenv("STRATA_PF_F16_GRID");
+        const int requested = value ? std::atoi(value) : 16;
+        const unsigned effective = requested == 8 || requested == 32 || requested == 64 || requested == 128 ||
+                                   requested == 256 || requested == 512 ? unsigned(requested) : 16u;
+        if (effective >= 128)
+            std::fprintf(stderr, "strata prefill: native F16 expert grid.y=%u (requested %d)\n", effective, requested);
+        return effective;
+    }();
+    static const bool d128 = [] { const char* e = std::getenv("STRATA_PF_F16_DOWN_TILE"); return e && std::atoi(e) == 128; }();
+    static const bool d192 = [] { const char* e = std::getenv("STRATA_PF_F16_DOWN_TILE"); return e && std::atoi(e) == 192; }();
+    static const bool unroll = [] { const char* e = std::getenv("STRATA_PF_F16_UNROLL"); return e && e[0] == '1'; }();
+    static const int gu_bn = [] { const char* e = std::getenv("STRATA_PF_GU_BN"); return e ? std::atoi(e) : 128; }();
+    const auto gate_up = [&]<bool UNROLL>() {
+        if (gu_bn == 192) {
+            if (g.gu_type == T_Q4_K)
+                f16_gu192::RoutedF16GEMMKernel<T_Q4_K,128,192,2,true,UNROLL><<<dim3(10,grid_y),256,0,s>>>(
+                    b,g,tb,input,src,nullptr,hidden,640,2560,input_stride);
+            else
+                f16_gu192::RoutedF16GEMMKernel<T_Q5_K,128,192,2,true,UNROLL><<<dim3(10,grid_y),256,0,s>>>(
+                    b,g,tb,input,src,nullptr,hidden,640,2560,input_stride);
+            return;
+        }
+        if (g.gu_type == T_Q4_K)
+            f16_moe::RoutedF16GEMMKernel<T_Q4_K, 128, 128, 2, true, UNROLL><<<dim3(10, grid_y), 256, 0, s>>>(
+                b, g, tb, input, src, nullptr, hidden, 640, 2560, input_stride);
+        else
+            f16_moe::RoutedF16GEMMKernel<T_Q5_K, 128, 128, 2, true, UNROLL><<<dim3(10, grid_y), 256, 0, s>>>(
+                b, g, tb, input, src, nullptr, hidden, 640, 2560, input_stride);
+    };
+    const auto project_down = [&]<int BN>() {
+        if (g.d_type == T_Q5_1)
+            f16_moe::RoutedF16GEMMKernel<T_Q5_1, 128, BN, 2><<<dim3(20, grid_y), 256, 0, s>>>(
+                b, g, tb, hidden, nullptr, down, down_half, 2560, 640);
+        else
+            f16_moe::RoutedF16GEMMKernel<T_Q8_0, 128, BN, 2><<<dim3(20, grid_y), 256, 0, s>>>(
+                b, g, tb, hidden, nullptr, down, down_half, 2560, 640);
+    };
+    if (unroll) gate_up.template operator()<true>();
+    else gate_up.template operator()<false>();
+    if (d192 && half_down && tokens >= 8192 && (g.d_type == T_Q5_1 || g.d_type == T_Q8_0)) {
+        if (g.d_type == T_Q5_1)
+            f16_down192::RoutedF16GEMMKernel<T_Q5_1, 128, 192, 2><<<dim3(20, grid_y), 256, 0, s>>>(
+                b, g, tb, hidden, nullptr, down, down_half, 2560, 640);
+        else
+            f16_down192::RoutedF16GEMMKernel<T_Q8_0, 128, 192, 2><<<dim3(20, grid_y), 256, 0, s>>>(
+                b, g, tb, hidden, nullptr, down, down_half, 2560, 640);
+    } else if (d192) {
+        // The larger tile was measured on long prefill chunks; keep small requests on the old 128 tile.
+        project_down.template operator()<128>();
+    } else {
+    if (d128) project_down.template operator()<128>(); else project_down.template operator()<64>();
+    }
+    ck(cudaGetLastError(), "experts_native_f16");
+#else
+    (void) b; (void) g; (void) n_expert; (void) scratch; (void) x; (void) src; (void) h; (void) dm; (void) stream; (void) half_down; (void) input_stride; (void) tokens;
+#endif
 }
 
 }  // namespace strata::prefill::fused

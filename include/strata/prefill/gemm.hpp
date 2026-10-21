@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <cstdint>
+
 #include <string>
 
 namespace strata::prefill {
@@ -57,6 +58,15 @@ public:
     /// the card's shared memory runs through llama.cpp's int8 MMQ instead (opt-in: STRATA_DENSE_MMQ=1).
     void native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                 int64_t ldy = 0, float beta = 0.0f, int64_t ldx = 0);
+
+    // Opt-in exact shared-expert UP + SwiGLU; 0 before launches, 1 queued, -1 terminal error.
+    int native_shared_up(const uint16_t* X, int ggml_type, const void* W_blocks, const float* gate,
+                         uint16_t* H, int64_t T, int64_t N, int64_t K, int64_t ldx = 0);
+
+    // 0: unsupported before projection; 1: fused projection/conv queued; -1: launch error, no fallback.
+    int native_ssm(const uint16_t* X, int ggml_type, const void* W_blocks, float* qkv,
+                   const float* conv_w, float* history, float* h, int64_t T, int64_t N,
+                   int64_t K, float eps, int64_t ldx = 0);
 
     /// HIP gfx103x (prompt_f16()): bf16() takes X as the FP16 image the prompt path's kernels write (set_act_f16),
     /// and bf16() / f16() / native() run the GEMM with FP16 out (rocBLAS's tuned kernels there), widened in place in

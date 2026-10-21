@@ -1,3 +1,20 @@
+# gfx1151 optimization branch
+
+Based on upstream **v0.2.1.4** (`9de04cd4`, engine 0.1.46.3).
+Adds opt-in WMMA expert tiles, fused HC/dense/GDN/attention work, fewer intermediate
+memory writes and copies, and one-token decode state commits for Ryzen AI Max+ 395.
+The original weights, int8 KV and native 262144-token context are retained.
+
+Same-day CYBER-FROST Q4 test (16602-token uncached prompts, 256 generated tokens,
+three trials): **1295.4 tokens/s prefill, 25.9 tokens/s decode**; preserved optimized
+build: 1290.2 / 25.9. Current sampled power is about 55 W; the earlier ~1844 prefill
+result from the 120 W session was not reproduced.
+
+Build, tuning presets, validation and limitations: [hardware tuning](docs/HARDWARE_TUNING.md).
+Old checkouts and binaries are preserved separately; external cache-server work is excluded.
+
+---
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="apps/host/public/brand/strata-lockup-dark.svg">
